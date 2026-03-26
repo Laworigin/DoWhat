@@ -82,3 +82,8 @@ dist-electron/
 # ===========================
 test-vision.js
 dev-app-update.yml
+
+# ===========================
+# Test images (should not be committed)
+# ===========================
+src/main/img*.png
