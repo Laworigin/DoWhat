@@ -200,7 +200,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## ⭐ Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=your-repo/dowhat&type=Date)](https://star-history.com/#your-repo/dowhat&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=Laworigin/DoWhat&type=Date)](https://star-history.com/#Laworigin/DoWhat&Date)
 
 ---
 
