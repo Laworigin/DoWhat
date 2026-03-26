@@ -200,9 +200,7 @@ src/
 
 ## ⭐ Star 增长曲线
 
-[![GitHub stars](https://img.shields.io/github/stars/Laworigin/DoWhat?style=social)](https://github.com/Laworigin/DoWhat/stargazers)
-
-[![Star History Chart](https://api.star-history.com/svg?repos=Laworigin/DoWhat&type=Date)](https://star-history.com/#Laworigin/DoWhat&Date)
+[![Star History Chart](https://api.star-history.com/image?repos=Laworigin/DoWhat&type=date&legend=top-left)](https://www.star-history.com/?repos=Laworigin%2FDoWhat&type=date&legend=top-left)
 
 ---
 
