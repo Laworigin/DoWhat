@@ -12,9 +12,9 @@
 
 ### 返回 JSON：
 {
-  "title": "任务标题",
+  "title": "任务标题（≤15字）",
   "progress": 进度数字,
-  "subtasks": "后续待办清单 (使用换行符分隔)",
+  "subtasks": "后续待办清单（每条≤20字，最多3条，使用换行符分隔）",
   "category": "week/day/month",
   "color": "Tailwind 类名"
 }

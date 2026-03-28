@@ -13,10 +13,11 @@ interface BacklogItem {
   task_date?: string
   /** 指向最原始任务的 ID，跨日继承时用于去重追溯 */
   origin_id?: string | null
+  description?: string
   subtasks?: { title: string; completed: boolean }[]
 }
 
-const TODAY_SLOT_COUNT = 10
+
 
 // ─── PipelineItem：单条任务卡片 ──────────────────────────────────────────────
 interface PipelineItemProps {
@@ -50,7 +51,7 @@ const PipelineItem: React.FC<PipelineItemProps> = ({ item, onToggle, variant = '
         </div>
       )}
 
-      <div className="flex items-start justify-between gap-3 mb-1.5">
+      <div className="flex items-start justify-between gap-3 mb-1">
         <p className={`text-[12px] leading-snug flex-1 ${item.completed ? 'text-gray-500 line-through' : 'text-white'}`}>
           {item.title}
         </p>
@@ -61,6 +62,13 @@ const PipelineItem: React.FC<PipelineItemProps> = ({ item, onToggle, variant = '
           {item.completed ? <CheckCircle2 className="w-4 h-4" /> : <Circle className="w-4 h-4" />}
         </button>
       </div>
+
+      {/* 任务描述 */}
+      {item.description && !item.completed && (
+        <p className="text-[10px] leading-relaxed text-gray-400 mb-1.5 line-clamp-2">
+          {item.description}
+        </p>
+      )}
 
       {/* AI 推荐徽章 */}
       {isPromoted && !item.completed && (
@@ -104,68 +112,58 @@ const SectionHeader: React.FC<SectionHeaderProps> = ({ label, count, dotColor, c
   </button>
 )
 
-// ─── PipelinePanel：三区分层面板 ─────────────────────────────────────────────
+// ─── PipelinePanel：四区分层面板（最高优先级 / 日常任务 / 待处理 / 已完成）───
 interface PipelinePanelProps {
   backlog: BacklogItem[]
   onToggle: (id: string, completed: boolean) => void
-  promotedTodayIds: Set<string>
 }
 
-const PipelinePanel: React.FC<PipelinePanelProps> = ({ backlog, onToggle, promotedTodayIds }) => {
-  const [isFocusCollapsed, setIsFocusCollapsed] = useState(false)
-  const [isTodayCollapsed, setIsTodayCollapsed] = useState(false)
+const PipelinePanel: React.FC<PipelinePanelProps> = ({ backlog, onToggle }) => {
+  const [isHighPriorityCollapsed, setIsHighPriorityCollapsed] = useState(false)
+  const [isDailyCollapsed, setIsDailyCollapsed] = useState(false)
   const [isBacklogCollapsed, setIsBacklogCollapsed] = useState(false)
-  const [isCompletedCollapsed, setIsCompletedCollapsed] = useState(false)
+  const [isCompletedCollapsed, setIsCompletedCollapsed] = useState(true)
   const [isBacklogExpanded, setIsBacklogExpanded] = useState(false)
 
   const activeTasks = backlog.filter((item) => !item.completed)
   const completedTasks = backlog.filter((item) => item.completed)
 
-  // 重点关注区：priority === 1，最多 5 个，按优先级排序
-  const focusTasks = activeTasks
+  // 最高优先级：priority === 1，按创建时间倒序
+  const highPriorityTasks = activeTasks
     .filter((item) => item.priority === 1)
     .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
-    .slice(0, 5)
 
-  // 今日原生任务：category === 'day' 且非 priority 1，按优先级排序
-  const nativeTodayTasks = activeTasks
+  // 日常任务：category === 'day' 且非最高优先级，按优先级排序
+  const dailyTasks = activeTasks
     .filter((item) => item.category === 'day' && item.priority !== 1)
     .sort((a, b) => (a.priority ?? 3) - (b.priority ?? 3))
 
-  // AI 补充进今日的 BACKLOG 任务，按优先级排序
-  const promotedTasks = activeTasks
-    .filter((item) => item.category === 'backlog' && promotedTodayIds.has(String(item.id)))
-    .sort((a, b) => (a.priority ?? 3) - (b.priority ?? 3))
-
-  // 最终今日任务列表（原生 + AI 补充，总计最多 10 个）
-  const todayTasks = [...nativeTodayTasks, ...promotedTasks].slice(0, TODAY_SLOT_COUNT)
-
-  // 待处理区：category === 'backlog' 且未被 AI 选中，按优先级排序
-  const remainingBacklogTasks = activeTasks
-    .filter((item) => item.category === 'backlog' && !promotedTodayIds.has(String(item.id)))
+  // 待处理：category === 'backlog' 且非最高优先级，按优先级+时间排序
+  const backlogTasks = activeTasks
+    .filter((item) => item.category === 'backlog' && item.priority !== 1)
     .sort((a, b) => {
       const priorityDiff = (a.priority ?? 3) - (b.priority ?? 3)
       if (priorityDiff !== 0) return priorityDiff
       return new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
     })
 
-  const visibleBacklogTasks = isBacklogExpanded ? remainingBacklogTasks : remainingBacklogTasks.slice(0, 5)
+  const visibleBacklogTasks = isBacklogExpanded ? backlogTasks : backlogTasks.slice(0, 5)
 
   return (
     <div className="space-y-4">
-      {/* ── 重点关注区 ── */}
-      {focusTasks.length > 0 && (
+      {/* ── 最高优先级 ── */}
+      {highPriorityTasks.length > 0 && (
         <div>
           <SectionHeader
-            label="⚡ 重点关注"
-            count={focusTasks.length}
+            label="🔥 最高优先级"
+            count={highPriorityTasks.length}
             dotColor="bg-red-500"
-            collapsed={isFocusCollapsed}
-            onToggleCollapse={() => setIsFocusCollapsed((prev) => !prev)}
+            collapsed={isHighPriorityCollapsed}
+            onToggleCollapse={() => setIsHighPriorityCollapsed((prev) => !prev)}
           />
-          {!isFocusCollapsed && (
+          {!isHighPriorityCollapsed && (
             <div className="space-y-2">
-              {focusTasks.map((item) => (
+              {highPriorityTasks.map((item) => (
                 <PipelineItem key={item.id} item={item} onToggle={onToggle} variant="focus" />
               ))}
             </div>
@@ -173,30 +171,24 @@ const PipelinePanel: React.FC<PipelinePanelProps> = ({ backlog, onToggle, promot
         </div>
       )}
 
-      {/* ── 今日任务区 ── */}
+      {/* ── 日常任务 ── */}
       <div>
         <SectionHeader
-          label="今日任务"
-          count={todayTasks.length}
+          label="📋 日常任务"
+          count={dailyTasks.length}
           dotColor="bg-indigo-500"
-          collapsed={isTodayCollapsed}
-          onToggleCollapse={() => setIsTodayCollapsed((prev) => !prev)}
+          collapsed={isDailyCollapsed}
+          onToggleCollapse={() => setIsDailyCollapsed((prev) => !prev)}
         />
-        {!isTodayCollapsed && (
+        {!isDailyCollapsed && (
           <div className="space-y-2">
-            {todayTasks.map((item) => (
-              <PipelineItem
-                key={item.id}
-                item={item}
-                onToggle={onToggle}
-                variant="today"
-                isPromoted={promotedTodayIds.has(String(item.id))}
-              />
+            {dailyTasks.map((item) => (
+              <PipelineItem key={item.id} item={item} onToggle={onToggle} variant="today" />
             ))}
-            {todayTasks.length === 0 && (
+            {dailyTasks.length === 0 && (
               <div className="py-6 text-center border border-dashed border-white/5 rounded-xl">
                 <p className="text-[10px] text-gray-600 font-bold tracking-widest">
-                  今日任务已清空 🎉
+                  暂无日常任务
                 </p>
               </div>
             )}
@@ -204,13 +196,13 @@ const PipelinePanel: React.FC<PipelinePanelProps> = ({ backlog, onToggle, promot
         )}
       </div>
 
-      {/* ── 待处理区 ── */}
-      {remainingBacklogTasks.length > 0 && (
+      {/* ── 待处理 ── */}
+      {backlogTasks.length > 0 && (
         <div>
           <SectionHeader
-            label="待处理"
-            count={remainingBacklogTasks.length}
-            dotColor="bg-gray-500"
+            label="📥 待处理"
+            count={backlogTasks.length}
+            dotColor="bg-amber-500"
             collapsed={isBacklogCollapsed}
             onToggleCollapse={() => setIsBacklogCollapsed((prev) => !prev)}
           />
@@ -221,7 +213,7 @@ const PipelinePanel: React.FC<PipelinePanelProps> = ({ backlog, onToggle, promot
                   <PipelineItem key={item.id} item={item} onToggle={onToggle} variant="backlog" />
                 ))}
               </div>
-              {remainingBacklogTasks.length > 5 && (
+              {backlogTasks.length > 5 && (
                 <button
                   onClick={() => setIsBacklogExpanded((prev) => !prev)}
                   className="mt-2 w-full py-1.5 flex items-center justify-center gap-1.5 text-[9px] font-black text-gray-500 hover:text-gray-300 tracking-widest transition-colors"
@@ -229,7 +221,7 @@ const PipelinePanel: React.FC<PipelinePanelProps> = ({ backlog, onToggle, promot
                   {isBacklogExpanded ? (
                     <><ChevronUp className="w-3 h-3" /> 收起</>
                   ) : (
-                    <><ChevronDown className="w-3 h-3" /> 查看全部 {remainingBacklogTasks.length} 条</>
+                    <><ChevronDown className="w-3 h-3" /> 查看全部 {backlogTasks.length} 条</>
                   )}
                 </button>
               )}
@@ -238,11 +230,11 @@ const PipelinePanel: React.FC<PipelinePanelProps> = ({ backlog, onToggle, promot
         </div>
       )}
 
-      {/* ── 已完成区 ── */}
+      {/* ── 已完成 ── */}
       {completedTasks.length > 0 && (
         <div className="pt-2 border-t border-white/5">
           <SectionHeader
-            label={`✓ 已完成`}
+            label="✅ 已完成"
             count={completedTasks.length}
             dotColor="bg-green-500"
             collapsed={isCompletedCollapsed}
@@ -466,6 +458,7 @@ interface ContextGroupCardProps {
 
 function ContextGroupCard({ group, isExpanded, onToggle }: ContextGroupCardProps): React.ReactElement {
   const handleToggle = (): void => onToggle(group.key)
+  const [descriptionExpanded, setDescriptionExpanded] = useState(false)
   const firstItem = group.items[group.items.length - 1]
   const lastItem = group.items[0]
 
@@ -508,13 +501,17 @@ function ContextGroupCard({ group, isExpanded, onToggle }: ContextGroupCardProps
         </div>
       </div>
 
-      {/* 截图区域：默认展示前两行，展开后显示全部 */}
-      <div className="px-3 pb-3">
-        {isExpanded && group.description && (
-          <p className="text-[12px] text-gray-400 mb-2.5 leading-relaxed font-medium bg-white/[0.03] px-3 py-2 rounded-lg border border-white/5 border-l-2 border-l-indigo-500/40">
+      {/* 描述区域：始终显示在标题下方 */}
+      {group.description && (
+        <div className="px-3 pb-2">
+          <p className="text-[12px] text-gray-400 leading-relaxed font-medium bg-white/[0.03] px-3 py-2 rounded-lg border border-white/5 border-l-2 border-l-indigo-500/40 animate-in fade-in slide-in-from-top-1 duration-200">
             {group.description}
           </p>
-        )}
+        </div>
+      )}
+
+      {/* 截图区域：默认展示前两行，展开后显示全部 */}
+      <div className="px-3 pb-3">
         {isExpanded && group.tags && group.tags.length > 0 && (
           <div className="flex gap-1.5 mb-2.5 flex-wrap">
             {group.tags.map((tag, tagIndex) => (
@@ -632,12 +629,19 @@ const Timeline: React.FC<{ contexts: ContextItem[] }> = ({ contexts }) => {
 }
 
 export const ContextView: React.FC = () => {
-  const [currentDate, setCurrentDate] = useState(new Date())
+  // 确保始终使用今天的日期（去除时分秒，只保留年月日）
+  const getTodayDate = (): Date => {
+    const now = new Date()
+    now.setHours(0, 0, 0, 0)
+    return now
+  }
+
+  const [currentDate, setCurrentDate] = useState(getTodayDate())
   const [contexts, setContexts] = useState<ContextItem[]>([])
   const [groupedContexts, setGroupedContexts] = useState<ContextGroup[]>([])
   const [currentIntent, setCurrentIntent] = useState<ContextItem | null>(null)
   const [backlog, setBacklog] = useState<BacklogItem[]>([])
-  const [promotedTodayIds, setPromotedTodayIds] = useState<Set<string>>(new Set())
+
   const [stageSummary, setStageSummary] = useState<string>('')
   const [allSummaries, setAllSummaries] = useState<{ timestamp: number; content: string }[]>([])
   const [isPipelineOpen, setIsPipelineOpen] = useState(true)
@@ -645,9 +649,16 @@ export const ContextView: React.FC = () => {
   // slot_summaries：key 为槽起始时间戳（ms），value 为 AI 归纳摘要
   const [slotSummaries, setSlotSummaries] = useState<Map<number, string>>(new Map())
 
+  // 注意：不再强制切换到今天，允许用户自由查看历史数据
+  // 如果需要在跨日时自动切换，可以在这里添加逻辑，但要注意不要影响用户手动切换日期的功能
+
   // 从数据库加载当天所有槽摘要
   const loadSlotSummaries = async (): Promise<void> => {
-    const dateStr = currentDate.toISOString().split('T')[0]
+    // 使用本地时间格式化日期，避免 UTC 时区偏移（与 loadContexts 保持一致）
+    const year = currentDate.getFullYear()
+    const month = String(currentDate.getMonth() + 1).padStart(2, '0')
+    const day = String(currentDate.getDate()).padStart(2, '0')
+    const dateStr = `${year}-${month}-${day}`
     const data = await window.api.getSlotSummaries(dateStr)
     const summaryMap = new Map<number, string>()
     data.forEach((row) => {
@@ -667,7 +678,11 @@ export const ContextView: React.FC = () => {
 
   // 加载 Context 数据
   const loadContexts = async (): Promise<void> => {
-    const dateStr = currentDate.toISOString().split('T')[0]
+    // 使用本地时间格式化日期，避免 UTC 时区偏移问题
+    const year = currentDate.getFullYear()
+    const month = String(currentDate.getMonth() + 1).padStart(2, '0')
+    const day = String(currentDate.getDate()).padStart(2, '0')
+    const dateStr = `${year}-${month}-${day}`
     const data = (await window.api.getContexts(dateStr)) as ContextItem[]
 
     const parsedData = data.map((item) => ({
@@ -692,54 +707,20 @@ export const ContextView: React.FC = () => {
     }
   }
 
-  // 按优先级直接从 BACKLOG 取前 N 个任务补充到今日任务槽位（纯前端计算，无需 AI）
-  // backlog 变化时立即触发，同时每 5 分钟定时刷新一次
+  // 每 5 分钟定时刷新 backlog
   useEffect(() => {
-    const fillTodaySlots = (currentBacklog: BacklogItem[]): void => {
-      const activeTasks = currentBacklog.filter((item) => !item.completed)
-      const nativeTodayCount = activeTasks.filter(
-        (item) => item.category === 'day' && item.priority !== 1
-      ).length
-      const backlogTasks = activeTasks
-        .filter((item) => item.category === 'backlog')
-        .sort((a, b) => {
-          const priorityDiff = (a.priority ?? 3) - (b.priority ?? 3)
-          if (priorityDiff !== 0) return priorityDiff
-          return new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-        })
-
-      const slotsNeeded = Math.max(0, TODAY_SLOT_COUNT - nativeTodayCount)
-
-      // 槽位已满或没有 BACKLOG 可补充，清空推荐列表
-      if (slotsNeeded === 0 || backlogTasks.length === 0) {
-        setPromotedTodayIds(new Set())
-        return
-      }
-
-      // 直接取优先级最高的前 N 个任务
-      const selectedIds = backlogTasks
-        .slice(0, slotsNeeded)
-        .map((item) => String(item.id))
-      setPromotedTodayIds(new Set(selectedIds))
-    }
-
-    // backlog 变化时立即执行一次
-    fillTodaySlots(backlog)
-
-    // 每 5 分钟定时刷新：重新拉取最新 backlog 后再重新计算
     const FIVE_MINUTES_MS = 5 * 60 * 1000
     const intervalId = setInterval(async () => {
       try {
         const latestBacklog = (await window.api.getVisibleBacklog()) as BacklogItem[]
         setBacklog(latestBacklog || [])
-        fillTodaySlots(latestBacklog || [])
       } catch (err) {
         console.error('[ContextView] 定时刷新 backlog 失败:', err)
       }
     }, FIVE_MINUTES_MS)
 
     return () => clearInterval(intervalId)
-  }, [backlog])
+  }, [])
 
   // 加载最新阶段总结
   const loadStageSummary = async (): Promise<void> => {
@@ -749,7 +730,11 @@ export const ContextView: React.FC = () => {
 
   // 加载聚合总结列表 (5分钟级别)
   const loadSummaries = async (): Promise<void> => {
-    const dateStr = currentDate.toISOString().split('T')[0]
+    // 使用本地时间格式化日期，避免 UTC 时区偏移
+    const year = currentDate.getFullYear()
+    const month = String(currentDate.getMonth() + 1).padStart(2, '0')
+    const day = String(currentDate.getDate()).padStart(2, '0')
+    const dateStr = `${year}-${month}-${day}`
     const data = await window.api.getSummariesForDate(dateStr, 5)
     setAllSummaries(data)
   }
@@ -841,7 +826,6 @@ export const ContextView: React.FC = () => {
             slotTitle = parsed.title?.trim() || ''
             slotDescription = parsed.description?.trim() || ''
           } catch {
-            // JSON 解析失败时直接用原始文本作标题
             slotTitle = trimmed
           }
         } else {
@@ -849,28 +833,46 @@ export const ContextView: React.FC = () => {
         }
       }
 
-      // DB 无摘要时，用频率最高的 ai_summary 文本兜底
+      // DB 无摘要时，从截图的 ai_summary 中聚合出更有意义的标题和描述
       if (!slotTitle) {
-        const titleFrequency = new Map<string, number>()
+        // 收集所有不重复的 ai_summary 原文（去重、过滤空值）
+        const uniqueSummaries: string[] = []
+        const seenSummaries = new Set<string>()
+        slotItems.forEach((item) => {
+          const raw = (item.ai_summary || '').trim()
+          if (raw && raw !== 'Unknown Activity' && !seenSummaries.has(raw)) {
+            seenSummaries.add(raw)
+            uniqueSummaries.push(raw)
+          }
+        })
+
+        // 提取应用名频率，用于标题
+        const appFrequency = new Map<string, number>()
         slotItems.forEach((item) => {
           const text = parseSummaryText(item.ai_summary || '')
           if (text && text !== 'Unknown Activity') {
-            titleFrequency.set(text, (titleFrequency.get(text) ?? 0) + 1)
+            appFrequency.set(text, (appFrequency.get(text) ?? 0) + 1)
           }
         })
+
+        // 标题：用频率最高的应用名 + "使用中"，表示正在归纳
+        let topApp = ''
         let maxCount = 0
-        titleFrequency.forEach((count, title) => {
+        appFrequency.forEach((count, app) => {
           if (count > maxCount) {
             maxCount = count
-            slotTitle = title
+            topApp = app
           }
         })
-        if (!slotTitle) {
-          slotTitle = `${hh}:${mm} 的活动`
+        slotTitle = topApp ? `${topApp} 使用中（归纳中...）` : `${hh}:${mm} 的活动`
+
+        // 描述：将去重后的 ai_summary 拼接为详细描述，让用户能展开查看
+        if (!slotDescription && uniqueSummaries.length > 0) {
+          slotDescription = uniqueSummaries.slice(0, 10).join('；')
         }
       }
 
-      return {
+      const groupResult = {
         key: `slot-${slotStartMs}`,
         summary: slotTitle,
         description: slotDescription || undefined,
@@ -878,6 +880,8 @@ export const ContextView: React.FC = () => {
         startTime: Math.min(...timestamps),
         endTime: Math.min(Math.max(...timestamps), slotEndMs)
       }
+
+      return groupResult
     })
 
     setGroupedContexts(groups)
@@ -968,7 +972,6 @@ export const ContextView: React.FC = () => {
               await window.api.updateBacklogStatus(id, completed)
               await loadBacklog()
             }}
-            promotedTodayIds={promotedTodayIds}
           />
         </div>
       </div>

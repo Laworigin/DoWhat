@@ -5,7 +5,7 @@ import sharp from 'sharp'
 import OpenAI from 'openai'
 import * as db from './database'
 import { runStorageMaintenance } from './maintenance'
-import { PIPELINE_OPTIMIZATION_PROMPT } from './prompts/pipeline_optimization'
+import { TASK_DISCOVERY_PROMPT, TASK_COMPLETION_PROMPT, TASK_PRIORITY_PROMPT } from './prompts/pipeline_optimization'
 
 /**
  * 从本地文件加载提示词
@@ -632,11 +632,70 @@ export function startSlotSummaryLoop(): void {
     clearInterval(slotSummaryInterval)
   }
   console.log('[SlotSummary] 启动15分钟槽归纳定时任务（每10秒刷新）...')
-  // 启动时立即执行一次
+
+  // 启动时先清理非 JSON 格式的旧数据，让 AI 用新 prompt 重新归纳
+  const deletedCount = db.deleteNonJsonSlotSummaries()
+  if (deletedCount > 0) {
+    console.log(`[SlotSummary] 已清理 ${deletedCount} 条非 JSON 格式的旧摘要，将触发重新归纳`)
+  }
+
+  // 回溯当天所有缺少有效摘要的槽进行重新归纳
+  backfillTodaySlots().catch((err) => console.error('[SlotSummary] 回溯归纳失败:', err))
+
+  // 启动时立即执行一次当前槽
   runSlotSummaryTick().catch((err) => console.error('[SlotSummary] 初始归纳失败:', err))
   slotSummaryInterval = setInterval(() => {
     runSlotSummaryTick().catch((err) => console.error('[SlotSummary] 定时归纳失败:', err))
   }, SLOT_REFRESH_INTERVAL_MS)
+}
+
+/**
+ * 回溯当天所有有 context 数据但缺少有效 JSON 摘要的槽，逐个触发 AI 归纳。
+ * 避免一次性发起过多请求，每个槽之间间隔 2 秒。
+ */
+async function backfillTodaySlots(): Promise<void> {
+  const now = Date.now()
+  const todayStart = new Date()
+  todayStart.setHours(0, 0, 0, 0)
+  const todayStartMs = todayStart.getTime()
+
+  const year = todayStart.getFullYear()
+  const month = String(todayStart.getMonth() + 1).padStart(2, '0')
+  const day = String(todayStart.getDate()).padStart(2, '0')
+  const todayDateStr = `${year}-${month}-${day}`
+
+  const existingSummaries = db.getSlotSummariesForDate(todayDateStr)
+  const validSlotKeys = new Set(
+    existingSummaries
+      .filter((s) => s.summary.trim().startsWith('{'))
+      .map((s) => s.slot_start_ms)
+  )
+
+  // 找出当天所有有 context 数据的槽
+  const contexts = db.getContextsSince(todayStartMs) as ContextRecord[]
+  const slotKeysWithData = new Set<number>()
+  contexts.forEach((c) => {
+    if (c.timestamp < now) {
+      slotKeysWithData.add(getSlotStartMs(c.timestamp))
+    }
+  })
+
+  // 找出需要重新归纳的槽（有数据但无有效 JSON 摘要）
+  const slotsToBackfill = Array.from(slotKeysWithData)
+    .filter((slotMs) => !validSlotKeys.has(slotMs))
+    .sort((a, b) => b - a)
+
+  if (slotsToBackfill.length === 0) return
+
+  console.log(`[SlotSummary] 发现 ${slotsToBackfill.length} 个槽需要回溯归纳...`)
+
+  for (const slotMs of slotsToBackfill) {
+    await summarizeSlot(slotMs)
+    // 每个槽之间间隔 2 秒，避免 API 限流
+    await new Promise((resolve) => setTimeout(resolve, 2000))
+  }
+
+  console.log(`[SlotSummary] 回溯归纳完成`)
 }
 
 export function stopSlotSummaryLoop(): void {
@@ -667,80 +726,169 @@ async function optimizeBacklogState(newActivity?: string): Promise<void> {
 
   try {
     const openai = new OpenAI({ apiKey, baseURL: endpoint.trim().replace(/\/+$/, '') })
-
-    // 获取今天未隐藏的任务作为上下文（让 AI 知道已有哪些任务，避免重复创建）
     const today = new Date().toISOString().split('T')[0]
-    const allBacklog = db.getBacklog() as { id: string; title: string; priority: number; completed: number; task_date: string; is_hidden: number }[]
+    const allBacklog = db.getBacklog() as { id: string; title: string; description?: string; priority: number; completed: number; task_date: string; is_hidden: number }[]
     const todayItems = allBacklog.filter(item => item.task_date === today && !item.is_hidden)
 
-    const existingTasksForAi = todayItems.map(item => ({
-      id: item.id,
-      title: item.title,
-      priority: item.priority ?? 3,
-      completed: !!item.completed
-    }))
-
-    console.log(`[Capturer] 正在分析最近活动，识别新任务和已完成任务... (现有任务: ${existingTasksForAi.length})`)
-
-    const response = await openai.chat.completions.create({
-      model: modelName || 'gpt-4o',
-      messages: [
-        {
-          role: 'system',
-          content: PIPELINE_OPTIMIZATION_PROMPT
-        },
-        {
-          role: 'user',
-          content: `### existing_tasks:
-${JSON.stringify(existingTasksForAi, null, 2)}
-
-### recent_activity:
-${newActivity}`
+    // 聚合最近的 slot summaries 作为更丰富的 recent_activity 上下文
+    const recentSlotSummaries = db.getSlotSummariesForDate(today)
+    const recentSummaryTexts = recentSlotSummaries
+      .slice(0, 8) // 最近 8 个 slot（约 2 小时）
+      .map(slot => {
+        try {
+          const parsed = JSON.parse(slot.summary)
+          return parsed.title || parsed.description || slot.summary
+        } catch {
+          return slot.summary
         }
-      ],
-      response_format: { type: 'json_object' }
-    })
+      })
+      .filter(Boolean)
 
-    const content = response.choices[0].message.content
-    if (!content) return
+    const fullRecentActivity = [
+      newActivity,
+      ...(recentSummaryTexts.length > 0 ? ['--- 更早的活动记录 ---', ...recentSummaryTexts] : [])
+    ].join('\n')
 
-    const result = JSON.parse(content)
     let hasChanges = false
 
-    // 1. 处理已有任务的完成状态更新（只允许更新 completed 字段，不修改标题）
-    if (result.existing_tasks && Array.isArray(result.existing_tasks)) {
-      for (const updatedTask of result.existing_tasks as { id: string; completed: boolean }[]) {
-        const originalTask = todayItems.find(item => item.id === updatedTask.id)
-        if (!originalTask) continue
+    // ─── Step 1: 新任务识别（独立 AI 调用）───────────────────────────────
+    console.log(`[Capturer] Step1: 识别新任务... (现有任务: ${todayItems.length})`)
+    try {
+      const existingTitles = todayItems.map(item => item.title)
+      const discoveryResponse = await openai.chat.completions.create({
+        model: modelName || 'gpt-4o',
+        messages: [
+          { role: 'system', content: TASK_DISCOVERY_PROMPT },
+          { role: 'user', content: `### existing_titles:\n${JSON.stringify(existingTitles)}\n\n### recent_activity:\n${newActivity}` }
+        ],
+        response_format: { type: 'json_object' }
+      })
 
-        // 只有当 AI 判断任务已完成，且原来未完成时，才更新状态
-        if (updatedTask.completed === true && !originalTask.completed) {
-          db.updateBacklogStatus(updatedTask.id, true)
-          console.log(`[Capturer] 任务已标记完成: "${originalTask.title}"`)
-          hasChanges = true
+      const discoveryContent = discoveryResponse.choices[0].message.content
+      if (discoveryContent) {
+        const discoveryResult = JSON.parse(discoveryContent)
+        if (discoveryResult.new_tasks && Array.isArray(discoveryResult.new_tasks)) {
+          const existingTitlesLower = todayItems.map(item => item.title.toLowerCase().trim())
+
+          for (const newTask of discoveryResult.new_tasks as { title: string; description?: string; category?: string }[]) {
+            if (!newTask.title || newTask.title.trim() === '') continue
+            const normalizedNewTitle = newTask.title.toLowerCase().trim()
+
+            // 本地去重
+            const isDuplicate = existingTitlesLower.some(existingTitle => {
+              if (existingTitle === normalizedNewTitle) return true
+              if (existingTitle.includes(normalizedNewTitle) || normalizedNewTitle.includes(existingTitle)) return true
+              return calculateTokenOverlap(existingTitle, normalizedNewTitle) > 0.6
+            })
+
+            if (isDuplicate) {
+              console.log(`[Capturer] 跳过重复任务: "${newTask.title}"`)
+              continue
+            }
+
+            const taskId = `ai_task_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+            db.addBacklogItem({
+              id: taskId,
+              title: newTask.title.trim(),
+              description: newTask.description?.trim() || '',
+              progress: 0,
+              subtasks: '',
+              color: 'bg-indigo-500',
+              category: newTask.category || 'backlog',
+              project_id: null,
+              created_at: Date.now(),
+              priority: 3
+            })
+            existingTitlesLower.push(normalizedNewTitle)
+            console.log(`[Capturer] 新任务已追加: "${newTask.title}"`)
+            hasChanges = true
+          }
         }
+      }
+      const discoveryTokens = discoveryResponse.usage?.total_tokens || 0
+      db.saveTokenUsage(discoveryTokens, modelName || 'gpt-4o', 'task_discovery')
+    } catch (error) {
+      console.error('[Capturer] Step1 新任务识别失败:', error)
+    }
+
+    // ─── Step 2: 完成状态判断（独立 AI 调用）───────────────────────────────
+    const uncompletedTasks = todayItems.filter(item => !item.completed)
+    if (uncompletedTasks.length > 0) {
+      console.log(`[Capturer] Step2: 判断完成状态... (未完成任务: ${uncompletedTasks.length})`)
+      try {
+        const tasksForCompletion = uncompletedTasks.map(item => ({ id: item.id, title: item.title }))
+        const completionResponse = await openai.chat.completions.create({
+          model: modelName || 'gpt-4o',
+          messages: [
+            { role: 'system', content: TASK_COMPLETION_PROMPT },
+            { role: 'user', content: `### uncompleted_tasks:\n${JSON.stringify(tasksForCompletion, null, 2)}\n\n### recent_activity:\n${fullRecentActivity}` }
+          ],
+          response_format: { type: 'json_object' }
+        })
+
+        const completionContent = completionResponse.choices[0].message.content
+        if (completionContent) {
+          const completionResult = JSON.parse(completionContent)
+          if (completionResult.completed_task_ids && Array.isArray(completionResult.completed_task_ids)) {
+            for (const taskId of completionResult.completed_task_ids as string[]) {
+              const originalTask = uncompletedTasks.find(item => item.id === taskId)
+              if (!originalTask) continue
+              db.updateBacklogStatus(taskId, true)
+              console.log(`[Capturer] 任务已标记完成: "${originalTask.title}"`)
+              hasChanges = true
+            }
+          }
+        }
+        const completionTokens = completionResponse.usage?.total_tokens || 0
+        db.saveTokenUsage(completionTokens, modelName || 'gpt-4o', 'task_completion')
+      } catch (error) {
+        console.error('[Capturer] Step2 完成状态判断失败:', error)
       }
     }
 
-    // 2. 追加新任务（AI 识别出的、DB 中尚不存在的待办）
-    if (result.new_tasks && Array.isArray(result.new_tasks) && result.new_tasks.length > 0) {
-      for (const newTask of result.new_tasks as { title: string; priority?: number; category?: string }[]) {
-        if (!newTask.title || newTask.title.trim() === '') continue
-
-        const taskId = `ai_task_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
-        db.addBacklogItem({
-          id: taskId,
-          title: newTask.title.trim(),
-          progress: 0,
-          subtasks: '',
-          color: 'bg-indigo-500',
-          category: newTask.category || 'backlog',
-          project_id: null,
-          created_at: Date.now(),
-          priority: newTask.priority ?? 3
+    // ─── Step 3: 优先级评估（独立 AI 调用）───────────────────────────────
+    // 重新获取未完成任务（Step2 可能已标记了一些为完成）
+    const refreshedBacklog = db.getBacklog() as { id: string; title: string; priority: number; completed: number; task_date: string; is_hidden: number }[]
+    const currentUncompletedTasks = refreshedBacklog.filter(item => item.task_date === today && !item.is_hidden && !item.completed)
+    if (currentUncompletedTasks.length > 0) {
+      console.log(`[Capturer] Step3: 评估优先级... (未完成任务: ${currentUncompletedTasks.length})`)
+      try {
+        const tasksForPriority = currentUncompletedTasks.map(item => ({ id: item.id, title: item.title, priority: item.priority ?? 3 }))
+        const priorityResponse = await openai.chat.completions.create({
+          model: modelName || 'gpt-4o',
+          messages: [
+            { role: 'system', content: TASK_PRIORITY_PROMPT },
+            { role: 'user', content: `### uncompleted_tasks:\n${JSON.stringify(tasksForPriority, null, 2)}\n\n### recent_activity:\n${newActivity}` }
+          ],
+          response_format: { type: 'json_object' }
         })
-        console.log(`[Capturer] 新任务已追加: "${newTask.title}"`)
-        hasChanges = true
+
+        const priorityContent = priorityResponse.choices[0].message.content
+        if (priorityContent) {
+          const priorityResult = JSON.parse(priorityContent)
+          const highPriorityIds = new Set<string>(
+            Array.isArray(priorityResult.high_priority_task_ids) ? priorityResult.high_priority_task_ids : []
+          )
+
+          for (const task of currentUncompletedTasks) {
+            const shouldBeHighPriority = highPriorityIds.has(task.id)
+            const currentlyHighPriority = task.priority === 1
+
+            if (shouldBeHighPriority && !currentlyHighPriority) {
+              db.updateBacklogPriority(task.id, 1)
+              console.log(`[Capturer] 任务提升为最高优先级: "${task.title}"`)
+              hasChanges = true
+            } else if (!shouldBeHighPriority && currentlyHighPriority) {
+              db.updateBacklogPriority(task.id, 3)
+              console.log(`[Capturer] 任务降级为普通优先级: "${task.title}"`)
+              hasChanges = true
+            }
+          }
+        }
+        const priorityTokens = priorityResponse.usage?.total_tokens || 0
+        db.saveTokenUsage(priorityTokens, modelName || 'gpt-4o', 'task_priority')
+      } catch (error) {
+        console.error('[Capturer] Step3 优先级评估失败:', error)
       }
     }
 
@@ -751,6 +899,33 @@ ${newActivity}`
   } catch (error) {
     console.error('[Capturer] optimizeBacklogState failed:', error)
   }
+}
+
+/**
+ * 计算两个字符串的 token（字符）重叠率，用于简易去重判断
+ * 将字符串拆分为 2-gram 集合，计算 Jaccard 相似度
+ */
+function calculateTokenOverlap(stringA: string, stringB: string): number {
+  const getBigrams = (text: string): Set<string> => {
+    const bigrams = new Set<string>()
+    for (let i = 0; i < text.length - 1; i++) {
+      bigrams.add(text.slice(i, i + 2))
+    }
+    return bigrams
+  }
+
+  const bigramsA = getBigrams(stringA)
+  const bigramsB = getBigrams(stringB)
+
+  if (bigramsA.size === 0 && bigramsB.size === 0) return 1
+
+  let intersectionCount = 0
+  for (const bigram of bigramsA) {
+    if (bigramsB.has(bigram)) intersectionCount++
+  }
+
+  const unionSize = bigramsA.size + bigramsB.size - intersectionCount
+  return unionSize === 0 ? 0 : intersectionCount / unionSize
 }
 
 // ─── 每日模型价格更新任务 ────────────────────────────────────────────────────

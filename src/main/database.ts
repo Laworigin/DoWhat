@@ -32,6 +32,7 @@ export function initDatabase(appDataPath?: string): void {
       CREATE TABLE IF NOT EXISTS backlog (
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
+        description TEXT,
         progress INTEGER DEFAULT 0,
         subtasks TEXT,
         color TEXT,
@@ -129,6 +130,15 @@ export function initDatabase(appDataPath?: string): void {
       }
     }
 
+    if (!columns.includes('description')) {
+      try {
+        db.exec('ALTER TABLE backlog ADD COLUMN description TEXT')
+        console.log('[DB] Added description column to backlog')
+      } catch (e) {
+        console.error('[DB] Failed to add description column:', e)
+      }
+    }
+
     console.log(`[DB] Database initialized successfully at: ${dbPath}`)
   } catch (error) {
     console.error('[DB] Database initialization failed:', error)
@@ -214,6 +224,7 @@ export function getProjects(): unknown[] {
 export function upsertBacklogItem(item: {
   id: string
   title: string
+  description?: string
   progress: number
   subtasks: string
   color: string
@@ -233,12 +244,14 @@ export function upsertBacklogItem(item: {
   const createdAt = item.created_at ?? now
   const taskDate = item.task_date ?? new Date(createdAt).toISOString().split('T')[0]
   const originId = item.origin_id ?? null
+  const description = item.description ?? null
 
   db.prepare(`
-    INSERT INTO backlog (id, title, progress, subtasks, color, completed, category, project_id, created_at, priority, is_hidden, task_date, origin_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+    INSERT INTO backlog (id, title, description, progress, subtasks, color, completed, category, project_id, created_at, priority, is_hidden, task_date, origin_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       title = excluded.title,
+      description = excluded.description,
       progress = excluded.progress,
       subtasks = excluded.subtasks,
       color = excluded.color,
@@ -250,6 +263,7 @@ export function upsertBacklogItem(item: {
   `).run(
     item.id,
     item.title,
+    description,
     item.progress,
     item.subtasks,
     item.color,
@@ -319,8 +333,8 @@ export function inheritUnfinishedTasks(): number {
 
   const insertStmt = db.prepare(`
     INSERT OR IGNORE INTO backlog
-      (id, title, progress, subtasks, color, completed, category, project_id, created_at, priority, is_hidden, task_date, origin_id)
-    VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 0, ?, ?)
+      (id, title, description, progress, subtasks, color, completed, category, project_id, created_at, priority, is_hidden, task_date, origin_id)
+    VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 0, ?, ?)
   `)
 
   for (const task of unfinishedHistoryTasks) {
@@ -339,6 +353,7 @@ export function inheritUnfinishedTasks(): number {
     insertStmt.run(
       newId,
       task.title,
+      task.description || null,
       task.progress,
       task.subtasks,
       task.color,
@@ -501,7 +516,9 @@ export function getMonthlyTokenUsage(): number {
 // Slot Summary 相关（15分钟槽的 AI 归纳摘要）
 export function upsertSlotSummary(slotStartMs: number, summary: string): void {
   if (!db) return
-  const date = new Date(slotStartMs).toISOString().split('T')[0]
+  // 使用本地时间格式化日期，避免 UTC 时区偏移
+  const d = new Date(slotStartMs)
+  const date = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
   db.prepare(`
     INSERT INTO slot_summaries (slot_start_ms, date, summary, updated_at)
     VALUES (?, ?, ?, ?)
@@ -516,6 +533,17 @@ export function getSlotSummariesForDate(date: string): { slot_start_ms: number; 
   return db
     .prepare('SELECT slot_start_ms, summary, updated_at FROM slot_summaries WHERE date = ? ORDER BY slot_start_ms DESC')
     .all(date) as { slot_start_ms: number; summary: string; updated_at: number }[]
+}
+
+/**
+ * 删除所有非 JSON 格式的旧 slot_summaries 记录（summary 不以 '{' 开头），
+ * 让后端定时任务重新用新 prompt 归纳生成 JSON 格式的 {title, description}。
+ * 返回被删除的记录数。
+ */
+export function deleteNonJsonSlotSummaries(): number {
+  if (!db) return 0
+  const result = db.prepare(`DELETE FROM slot_summaries WHERE TRIM(summary) NOT LIKE '{%'`).run()
+  return result.changes
 }
 
 // Model Pricing 相关

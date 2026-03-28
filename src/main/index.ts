@@ -48,6 +48,8 @@ function createWindow(): void {
 
   mainWindow.on('ready-to-show', () => {
     mainWindow.show()
+    // 在窗口底部打开开发者工具
+    mainWindow.webContents.openDevTools({ mode: 'bottom' })
   })
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
@@ -59,10 +61,10 @@ function createWindow(): void {
   // Load the remote URL for development or the local html file for production.
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
     mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
-    mainWindow.webContents.openDevTools() // 自动打开开发者工具
   } else {
     mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'))
   }
+
 }
 
 /**
