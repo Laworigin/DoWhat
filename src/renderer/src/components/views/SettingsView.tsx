@@ -77,6 +77,13 @@ const ModelConfigForm: React.FC = () => {
         setIsApiKeyMissing(false)
         setIsConnected(true)
 
+        // 同步 API Key 到 OpenClaw（如果已安装）
+        try {
+          await window.api.openclawSyncApiKey()
+        } catch {
+          // OpenClaw 未安装时忽略同步错误
+        }
+
         // 3秒后自动隐藏成功提示
         setTimeout(() => {
           setTestResult(null)

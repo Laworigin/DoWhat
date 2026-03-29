@@ -152,16 +152,17 @@ helping users clearly see what they should invest their time in right now.
 | **Task Priority** | AI evaluates priority, bidirectional adjustment | `TASK_PRIORITY_PROMPT` |
 | **Local Dedup** | 2-gram Jaccard similarity prevents duplicate tasks | `capturer.ts` |
 | **SQLite Storage** | 6 tables, fully local, no cloud dependency | `database.ts` |
-| **4 Frontend Views** | Context / Backlog / Stats / Settings | `renderer/src/components/views/` |
+| **5 Frontend Views** | Context / Backlog / Stats / OpenClaw / Settings | `renderer/src/components/views/` |
 | **IPC Bridge** | 30+ methods connecting frontend to backend | `preload/index.ts` |
 | **Stats & Insights** | Work statistics, AI-generated insights, token usage | `StatsView.tsx`, `stats_insight.txt` |
 | **Storage Maintenance** | Auto-cleanup of old screenshots | `maintenance.ts` |
 | **Multi-screen** | Capture and analyze multiple displays | `capturer.ts` |
 | **Cross-day Inheritance** | Auto carry-over unfinished tasks to next day | `capturer.ts` |
+| **OpenClaw Integration** | Auto-install, Gateway management, IM setup, WebView | `openclaw.ts`, `OpenClawView.tsx` |
 
-#### Next Milestone: OpenClaw Integration
+#### ✅ OpenClaw Integration (Completed)
 
-> **Goal**: Download DoWhat + configure API Key = ready to use OpenClaw.
+> **Achieved**: Download DoWhat + configure API Key = ready to use OpenClaw.
 > OpenClaw provides the execution capability; DoWhat provides the brain.
 
 ```
@@ -176,20 +177,24 @@ helping users clearly see what they should invest their time in right now.
 |  |  * Prioritize work        |  |  * Multi-step execution      |  |
 |  |  * Track completion       |  |  * Desktop automation        |  |
 |  |  * Provide context        +->+  * Code generation           |  |
-|  |                           |  |                              |  |
+|  |                           |  |  * IM Integration (WeChat/Feishu) |
 |  |  Reuses existing API Key  |  |  Receives task + context     |  |
 |  |  No extra configuration   |  |  Reports results back        |  |
 |  +---------------------------+  +------------------------------+  |
 +-------------------------------------------------------------------+
 ```
 
-| Item | Detail |
-|------|--------|
-| **Zero config** | Reuses DoWhat's existing API Key and Endpoint |
-| **Context injection** | Feeds DoWhat's behavioral history into OpenClaw Agent |
-| **Task delegation** | One-click delegate from backlog to OpenClaw |
-| **Result writeback** | OpenClaw auto-updates backlog on completion |
-| **Local-first** | Runs inside Electron, data stays on device |
+| Item | Detail | Status |
+|------|--------|--------|
+| **Zero config** | Reuses DoWhat's existing API Key and Endpoint | ✅ Done |
+| **Auto installation** | Automatically installs OpenClaw CLI on first launch | ✅ Done |
+| **Gateway management** | Auto-starts Gateway process with app lifecycle | ✅ Done |
+| **IM connectivity** | Connect to WeChat or Feishu for instant messaging | ✅ Done |
+| **WebView integration** | Embedded OpenClaw Dashboard in DoWhat UI | ✅ Done |
+| **Context injection** | Feeds DoWhat's behavioral history into OpenClaw Agent | 🔄 Planned |
+| **Task delegation** | One-click delegate from backlog to OpenClaw | 🔄 Planned |
+| **Result writeback** | OpenClaw auto-updates backlog on completion | 🔄 Planned |
+| **Local-first** | Runs inside Electron, data stays on device | ✅ Done |
 
 #### Future: Smarter Task Planning
 
@@ -203,6 +208,7 @@ helping users clearly see what they should invest their time in right now.
 | **Fatigue detection** | Detect low-productivity periods, suggest breaks | Planned |
 | **User preference profile** | Build a model of user's work style over time | Planned |
 | **Multi-screen support** | Capture and analyze multiple displays | Done |
+| **OpenClaw integration** | Built-in agent for IM connectivity and task execution | Done |
 | **Audio context awareness** | Detect meetings vs solo work from audio patterns | Planned |
 | **Long-term memory compression** | Compress old summaries to save context window | Planned |
 
@@ -281,6 +287,7 @@ dowhat/
 │   │   ├── index.ts                     # Window + IPC registration
 │   │   ├── capturer.ts                  # Screen capture + AI pipeline
 │   │   ├── recorder.ts                  # Audio capture + STT (planned)
+│   │   ├── openclaw.ts                  # OpenClaw installation & gateway
 │   │   ├── database.ts                  # SQLite (7+ tables)
 │   │   ├── maintenance.ts              # Storage cleanup
 │   │   └── prompts/                     # AI Prompt layer
@@ -309,6 +316,7 @@ dowhat/
 │           │       ├── ContextView.tsx   #   Timeline + summary + tasks
 │           │       ├── BacklogView.tsx   #   Task board (4 groups)
 │           │       ├── StatsView.tsx     #   Work stats + AI insights
+│           │       ├── OpenClawView.tsx  #   OpenClaw agent & IM setup
 │           │       └── SettingsView.tsx  #   Model configuration
 │           └── types/
 │               └── electron.d.ts        #   IPC type definitions
@@ -326,16 +334,17 @@ dowhat/
 ### Roadmap
 
 ```
-  v1.0 (Current)            v2.0 (Next)              v3.0 (Future)
+  v1.0 (Completed)          v2.0 (Current)           v3.0 (Future)
   ================          ================         ================
   Perceive + Plan           OpenClaw Integration     Smarter Planning
 
-  * Screen capture          * Audio capture + STT    * Behavior learning
-  * Vision AI analysis      * Integrate OpenClaw     * Proactive suggest
-  * 15-min slot summary     * Agent chat panel       * Fatigue detection
-  * Task auto-management    * One-click delegate     * Audio context aware
-  * Stats & insights        * Result writeback       * User profiling
-  * Local SQLite            * Reuse API Key          * Long-term memory
+  * Screen capture          * OpenClaw auto-install  * Behavior learning
+  * Vision AI analysis      * Gateway management     * Proactive suggest
+  * 15-min slot summary     * IM connectivity        * Fatigue detection
+  * Task auto-management    * WebView integration    * Audio context aware
+  * Stats & insights        * Audio capture + STT    * User profiling
+  * Local SQLite            * Agent chat panel       * Long-term memory
+  * Multi-screen            * Task delegation        * Context injection
   ================          ================         ================
-       Done                    In Progress               Planned
+       Done                 Partially Done               Planned
 ```

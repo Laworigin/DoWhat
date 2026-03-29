@@ -18,6 +18,19 @@ import {
   generateStatsInsight,
   setAppDataPath
 } from './capturer'
+import {
+  installOpenclaw,
+  syncApiKeyToOpenclaw,
+  setupChannel,
+  startGateway,
+  stopGateway,
+  isGatewayRunning,
+  getInstallStatus,
+  skipImConfiguration,
+  resetOpenclaw,
+  getDashboardUrl,
+  GATEWAY_PORT_NUMBER
+} from './openclaw'
 
 // 允许加载本地图片
 protocol.registerSchemesAsPrivileged([
@@ -42,14 +55,13 @@ function createWindow(): void {
       sandbox: false,
       nodeIntegration: true,
       contextIsolation: false,
-      webSecurity: false // 允许从 file:// 加载本地图片
+      webSecurity: false, // 允许从 file:// 加载本地图片
+      webviewTag: true // 允许使用 webview 标签（OpenClaw WebChat UI）
     }
   })
 
   mainWindow.on('ready-to-show', () => {
     mainWindow.show()
-    // 在窗口底部打开开发者工具
-    mainWindow.webContents.openDevTools({ mode: 'bottom' })
   })
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
@@ -144,7 +156,20 @@ function migrateData(userDataPath: string): void {
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(() => {
-  // 设置 Content-Security-Policy，允许加载 local-file:// 图片
+  // 拦截 OpenClaw Gateway 的 favicon.ico 请求，重定向到项目中的 openclaw.svg
+  session.defaultSession.webRequest.onBeforeRequest(
+    { urls: [`http://127.0.0.1:${GATEWAY_PORT_NUMBER}/favicon.ico`] },
+    (details, callback) => {
+      const openclawLogoPath = path.join(__dirname, '../../resources/openclaw.svg')
+      console.log(`[OpenClaw] Intercepting favicon.ico request, redirecting to: ${openclawLogoPath}`)
+
+      callback({
+        redirectURL: `file://${openclawLogoPath}`
+      })
+    }
+  )
+
+  // 设置 Content-Security-Policy，允许加载外部图片（包括 mintcdn.com）
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     console.log('[Main] onHeadersReceived for:', details.url)
     console.log('[Main] Original headers:', JSON.stringify(details.responseHeaders))
@@ -153,7 +178,7 @@ app.whenReady().then(() => {
       responseHeaders: {
         ...details.responseHeaders,
         'Content-Security-Policy': [
-          "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://images.unsplash.com local-file:;"
+          "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: local-file:;"
         ]
       }
     })
@@ -455,6 +480,42 @@ ${JSON.stringify(simplifiedContexts)}
     }
   })
 
+  // ===== OpenClaw IPC Handlers =====
+  ipcMain.handle('openclaw-install', async () => {
+    const mainWindow = BrowserWindow.getAllWindows()[0] || null
+    return installOpenclaw(mainWindow)
+  })
+
+  ipcMain.handle('openclaw-setup-channel', async (_, channel: 'weixin' | 'feishu') => {
+    const mainWindow = BrowserWindow.getAllWindows()[0] || null
+    return setupChannel(mainWindow, channel)
+  })
+
+  ipcMain.handle('openclaw-gateway-status', async () => {
+    const running = await isGatewayRunning()
+    return { running, port: GATEWAY_PORT_NUMBER }
+  })
+
+  ipcMain.handle('openclaw-get-install-status', () => {
+    return getInstallStatus()
+  })
+
+  ipcMain.handle('openclaw-reset', async () => {
+    resetOpenclaw()
+  })
+
+  ipcMain.handle('openclaw-sync-apikey', async () => {
+    return syncApiKeyToOpenclaw()
+  })
+
+  ipcMain.handle('openclaw-skip-im', async () => {
+    skipImConfiguration()
+  })
+
+  ipcMain.handle('openclaw-get-dashboard-url', async () => {
+    return getDashboardUrl()
+  })
+
   createWindow()
 
   // 应用启动时，若 AI 感知已开启则自动恢复捕获和槽摘要任务
@@ -468,11 +529,19 @@ ${JSON.stringify(simplifiedContexts)}
     startDailyPricingLoop()
   }
 
+  // 应用启动时，若 OpenClaw 已安装则自动启动 Gateway
+  startGateway()
+
   app.on('activate', function () {
     // On macOS it's common to re-create a window in the app when the
     // dock icon is clicked and there are no other windows open.
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
+})
+
+// 应用退出前关闭 OpenClaw Gateway
+app.on('before-quit', () => {
+  stopGateway()
 })
 
 // Quit when all windows are closed, except on macOS. There, it's common

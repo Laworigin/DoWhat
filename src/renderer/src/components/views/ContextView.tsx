@@ -458,7 +458,6 @@ interface ContextGroupCardProps {
 
 function ContextGroupCard({ group, isExpanded, onToggle }: ContextGroupCardProps): React.ReactElement {
   const handleToggle = (): void => onToggle(group.key)
-  const [descriptionExpanded, setDescriptionExpanded] = useState(false)
   const firstItem = group.items[group.items.length - 1]
   const lastItem = group.items[0]
 

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react'
-import { Target, Folder, BarChart3, Settings } from 'lucide-react'
+import { Target, Folder, BarChart3, Settings, Shell } from 'lucide-react'
 
 // 前端内置兜底价格表，与 capturer.ts 中的 BUILTIN_MODEL_PRICING 保持一致
 // 当 preload 的 getModelPricing 不可用或 DB 无数据时作为兜底
@@ -225,6 +225,12 @@ export const PrimaryNav: React.FC<PrimaryNavProps> = ({
             label="系统设置"
             active={activeSection === 'settings'}
             onClick={() => setActiveSection('settings')}
+          />
+          <NavItem
+            icon={Shell}
+            label="OpenClaw"
+            active={activeSection === 'openclaw'}
+            onClick={() => setActiveSection('openclaw')}
           />
         </ul>
       </nav>

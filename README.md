@@ -16,6 +16,20 @@
 
 ---
 
+## 📸 Screenshots
+
+### DoWhat Main Interface
+![DoWhat Main Interface](./resources/DoWhat.png)
+
+*DoWhat's main dashboard showing activity timeline, AI-generated summaries, and task management*
+
+### OpenClaw Integration
+![OpenClaw Integration](./resources/openclaw.png)
+
+*Built-in OpenClaw agent for IM integration and autonomous task execution*
+
+---
+
 ## What is DoWhat?
 
 DoWhat (做啥) is not just a desktop app — it's your **AI-native personal work agent**, a digital twin that lives on your machine and silently builds a complete picture of your professional life.
@@ -56,27 +70,35 @@ Think of it as giving yourself a **second brain for work**. While you focus on e
 - Configurable capture interval, model selection, and more
 - Data stored in system `userData` directory — safe across app updates
 
+### 🤖 OpenClaw Integration
+- **Zero-config setup**: Automatically reuses your DoWhat API key
+- **IM connectivity**: Connect to WeChat or Feishu for instant messaging
+- **Agent execution**: Delegate tasks from backlog to OpenClaw for autonomous completion
+- **Local-first**: Runs entirely within Electron, no external dependencies
+
 ---
 
 ## 🏗️ Architecture
 
 ```
-ContextAgent
+DoWhat
 ├── Main Process (Electron)
 │   ├── capturer.ts        — Screenshot capture loop (every 15s)
 │   ├── database.ts        — SQLite via better-sqlite3 (local storage)
+│   ├── openclaw.ts        — OpenClaw installation & gateway management
 │   └── index.ts           — IPC handlers, AI API calls
 ├── Renderer (React + TypeScript)
 │   ├── ContextView        — Main dashboard: timeline, snapshot grid
 │   ├── BacklogView        — Task backlog and pipeline panel
 │   ├── StatsView          — Usage statistics and insights
+│   ├── OpenClawView       — OpenClaw agent interface & IM setup
 │   └── SettingsView       — API key, model, and preferences
 └── Prompts
     ├── aggregation        — Slot summary generation prompt
     └── pipeline_optimization — Backlog task extraction prompt
 ```
 
-**Tech Stack**: Electron 39 · React 19 · TypeScript 5 · Tailwind CSS 4 · SQLite (better-sqlite3) · OpenAI SDK · electron-vite
+**Tech Stack**: Electron 39 · React 19 · TypeScript 5 · Tailwind CSS 4 · SQLite (better-sqlite3) · OpenAI SDK · OpenClaw · electron-vite
 
 ---
 

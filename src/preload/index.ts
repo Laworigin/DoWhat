@@ -30,7 +30,31 @@ const api = {
   getSlotSummaries: (date: string) =>
     ipcRenderer.invoke('get-slot-summaries', date),
   getModelPricing: (modelName: string) =>
-    ipcRenderer.invoke('get-model-pricing', modelName)
+    ipcRenderer.invoke('get-model-pricing', modelName),
+
+  // OpenClaw APIs
+  openclawInstall: () => ipcRenderer.invoke('openclaw-install'),
+  openclawSetupChannel: (channel: 'weixin' | 'feishu') => ipcRenderer.invoke('openclaw-setup-channel', channel),
+  openclawGatewayStatus: () => ipcRenderer.invoke('openclaw-gateway-status'),
+  openclawGetInstallStatus: () => ipcRenderer.invoke('openclaw-get-install-status'),
+  openclawReset: () => ipcRenderer.invoke('openclaw-reset'),
+  openclawSyncApiKey: () => ipcRenderer.invoke('openclaw-sync-apikey'),
+  openclawSkipIm: () => ipcRenderer.invoke('openclaw-skip-im'),
+  openclawGetDashboardUrl: () => ipcRenderer.invoke('openclaw-get-dashboard-url'),
+
+  // OpenClaw event listeners
+  onOpenclawInstallProgress: (callback: (data: { step: string; message: string }) => void) => {
+    ipcRenderer.on('openclaw-install-progress', (_event, data) => callback(data))
+  },
+  onOpenclawInstallError: (callback: (data: { error: string; detail?: string }) => void) => {
+    ipcRenderer.on('openclaw-install-error', (_event, data) => callback(data))
+  },
+  onOpenclawChannelQrcode: (callback: (data: { channel: string; qrData: string; type: string }) => void) => {
+    ipcRenderer.on('openclaw-channel-qrcode', (_event, data) => callback(data))
+  },
+  onOpenclawChannelStatus: (callback: (data: { channel: string; status: string; error?: string }) => void) => {
+    ipcRenderer.on('openclaw-channel-status', (_event, data) => callback(data))
+  }
 }
 
 // Use `contextBridge` APIs to expose Electron APIs to

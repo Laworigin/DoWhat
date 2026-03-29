@@ -5,6 +5,7 @@ import { SettingsView } from './components/views/SettingsView'
 import { BacklogView } from './components/views/BacklogView'
 import { StatsView } from './components/views/StatsView'
 import { PermissionOverlay } from './components/PermissionOverlay'
+import { OpenClawView } from './components/views/OpenClawView'
 
 const MainLayout: React.FC<{ children: React.ReactNode }> = ({ children }) => (
   <div className="flex h-screen bg-black/40 backdrop-blur-3xl text-white font-sans antialiased select-none overflow-hidden relative">
@@ -87,6 +88,8 @@ function App(): React.ReactElement {
         {activeSection === 'settings' && (
           <SettingsView activeTab={settingsTab} setActiveTab={setSettingsTab} />
         )}
+
+        {activeSection === 'openclaw' && <OpenClawView />}
       </main>
     </MainLayout>
   )

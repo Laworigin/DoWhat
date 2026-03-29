@@ -53,6 +53,7 @@
     "eslint-plugin-react-refresh": "^0.4.24",
     "postcss": "^8.5.8",
     "prettier": "^3.7.4",
+    "puppeteer-core": "^24.40.0",
     "react": "^19.2.1",
     "react-dom": "^19.2.1",
     "tailwindcss": "^4.2.2",

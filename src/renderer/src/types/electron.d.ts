@@ -43,5 +43,21 @@ interface Window {
       summaries: string[]
     ) => Promise<{ summary: string }>
     getSlotSummaries: (date: string) => Promise<{ slot_start_ms: number; summary: string; updated_at: number }[]>
+
+    // OpenClaw APIs
+    openclawInstall: () => Promise<{ success: boolean; error?: string }>
+    openclawSetupChannel: (channel: 'weixin' | 'feishu') => Promise<{ success: boolean; error?: string }>
+    openclawGatewayStatus: () => Promise<{ running: boolean; port: number }>
+    openclawGetInstallStatus: () => Promise<{ installed: boolean; imConfigured: boolean; imSkipped: boolean; channels: string[] }>
+    openclawReset: () => Promise<void>
+    openclawSyncApiKey: () => Promise<{ success: boolean; error?: string }>
+    openclawSkipIm: () => Promise<void>
+    openclawGetDashboardUrl: () => Promise<string>
+
+    // OpenClaw event listeners
+    onOpenclawInstallProgress: (callback: (data: { step: string; message: string }) => void) => void
+    onOpenclawInstallError: (callback: (data: { error: string; detail?: string }) => void) => void
+    onOpenclawChannelQrcode: (callback: (data: { channel: string; qrData: string; type: string }) => void) => void
+    onOpenclawChannelStatus: (callback: (data: { channel: string; status: string; error?: string }) => void) => void
   }
 }
