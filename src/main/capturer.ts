@@ -1095,3 +1095,138 @@ export function stopDailyPricingLoop(): void {
     dailyPricingTimer = null
   }
 }
+
+// ==================== 洞察报告定时缓存 ====================
+
+const INSIGHT_DAY_INTERVAL_MS = 10 * 60 * 1000   // 日报：每 10 分钟更新
+
+let insightCacheTimer: NodeJS.Timeout | null = null
+let lastWeeklyInsightDate = ''
+let lastMonthlyInsightDate = ''
+
+/**
+ * 为指定周期生成洞察报告并缓存到数据库
+ */
+async function generateAndCacheInsight(cycle: 'day' | 'week' | 'month'): Promise<void> {
+  const now = Date.now()
+  const oneDay = 24 * 60 * 60 * 1000
+
+  let startMs: number
+  if (cycle === 'day') {
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+    startMs = today.getTime()
+  } else if (cycle === 'week') {
+    startMs = now - 7 * oneDay
+  } else {
+    startMs = now - 30 * oneDay
+  }
+
+  // 从 slot_summaries 获取该周期内的所有 15 分钟槽归纳
+  const slotSummaries = db.getSlotSummariesInRange(startMs, now)
+
+  if (slotSummaries.length === 0) {
+    console.log(`[InsightCache] ${cycle} 周期无 slot_summaries 数据，跳过`)
+    return
+  }
+
+  const apiKey = db.getSetting('api_key')
+  const endpoint = db.getSetting('endpoint')
+  const modelName = db.getSetting('model_name') || 'qwen3.5-plus'
+
+  if (!apiKey || !endpoint) return
+
+  const openai = new OpenAI({
+    apiKey: apiKey,
+    baseURL: endpoint.trim().replace(/\/+$/, '')
+  })
+
+  // 将 slot_summaries 的 JSON 内容提取为可读文本
+  const contextTexts = slotSummaries.map((s) => {
+    const timeStr = new Date(s.slot_start_ms).toLocaleString('zh-CN', {
+      month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit'
+    })
+    try {
+      const parsed = JSON.parse(s.summary)
+      return `- [${timeStr}] ${parsed.title || ''}: ${parsed.description || ''}`
+    } catch {
+      return `- [${timeStr}] ${s.summary}`
+    }
+  }).join('\n')
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: modelName,
+      messages: [
+        {
+          role: 'system',
+          content: loadPrompt('stats_insight') || '生成生产力洞察报告并返回 JSON。'
+        },
+        {
+          role: 'user',
+          content: `这是用户在该时段内的行为总结（共 ${slotSummaries.length} 个15分钟时段）：\n${contextTexts}`
+        }
+      ],
+      response_format: { type: 'json_object' }
+    })
+
+    const content = response.choices[0].message.content
+    if (!content) return
+
+    const usage = response.usage?.total_tokens || 0
+    db.saveTokenUsage(usage, modelName, 'insight')
+
+    const cleanContent = content.replace(/```json/g, '').replace(/```/g, '').trim()
+    const parsed = JSON.parse(cleanContent) as { insight_text?: string; warning_text?: string }
+
+    if (parsed.insight_text) {
+      db.upsertInsightCache(cycle, parsed.insight_text, parsed.warning_text || null)
+      console.log(`[InsightCache] ${cycle} 洞察报告已缓存 (${slotSummaries.length} 个槽, ${usage} tokens)`)
+    }
+  } catch (error) {
+    console.error(`[InsightCache] ${cycle} 洞察生成失败:`, (error as Error).message)
+  }
+}
+
+async function runInsightCacheTick(): Promise<void> {
+  const todayStr = new Date().toISOString().split('T')[0]
+
+  // 日报：每次 tick 都更新（10 分钟间隔由 setInterval 控制）
+  await generateAndCacheInsight('day')
+
+  // 周报：每天只更新一次
+  if (lastWeeklyInsightDate !== todayStr) {
+    await generateAndCacheInsight('week')
+    lastWeeklyInsightDate = todayStr
+  }
+
+  // 月报：每天只更新一次
+  if (lastMonthlyInsightDate !== todayStr) {
+    await generateAndCacheInsight('month')
+    lastMonthlyInsightDate = todayStr
+  }
+}
+
+export function startInsightCacheLoop(): void {
+  if (insightCacheTimer) {
+    clearInterval(insightCacheTimer)
+  }
+  console.log('[InsightCache] 启动洞察报告定时缓存任务（日报每10分钟，周报/月报每天）...')
+
+  // 启动后延迟 30 秒执行第一次（等 slot_summaries 先准备好）
+  setTimeout(() => {
+    runInsightCacheTick().catch((err) => console.error('[InsightCache] 初始洞察生成失败:', err))
+  }, 30 * 1000)
+
+  insightCacheTimer = setInterval(() => {
+    runInsightCacheTick().catch((err) => console.error('[InsightCache] 定时洞察生成失败:', err))
+  }, INSIGHT_DAY_INTERVAL_MS)
+}
+
+export function stopInsightCacheLoop(): void {
+  if (insightCacheTimer) {
+    console.log('[InsightCache] 停止洞察报告定时缓存任务')
+    clearInterval(insightCacheTimer)
+    insightCacheTimer = null
+  }
+}

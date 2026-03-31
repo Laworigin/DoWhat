@@ -9,10 +9,16 @@ const api = {
   getBacklog: () => ipcRenderer.invoke('get-backlog'),
   updateBacklogStatus: (id: string, completed: boolean) =>
     ipcRenderer.invoke('update-backlog-status', id, completed),
+  addManualTask: (title: string, description?: string) =>
+    ipcRenderer.invoke('add-manual-task', title, description),
+  updateTask: (id: string, title: string, description?: string) =>
+    ipcRenderer.invoke('update-task', id, title, description),
+  reclassifyTask: (id: string, category: string, priority: number) =>
+    ipcRenderer.invoke('reclassify-task', id, category, priority),
   getVisibleBacklog: () => ipcRenderer.invoke('get-visible-backlog'),
   getProjects: () => ipcRenderer.invoke('get-projects'),
   getStatsSummary: (start: number, end: number) => ipcRenderer.invoke('get-stats-summary', start, end),
-  getStatsInsight: (start: number, end: number) => ipcRenderer.invoke('get-stats-insight', start, end),
+  getStatsInsight: (start: number, end: number, cycle?: string) => ipcRenderer.invoke('get-stats-insight', start, end, cycle),
   getMonthlyTokens: () => ipcRenderer.invoke('get-monthly-tokens'),
   checkScreenPermission: () => ipcRenderer.invoke('check-screen-permission'),
   openSystemPreferences: () => ipcRenderer.invoke('open-system-preferences'),

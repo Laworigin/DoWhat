@@ -4,31 +4,37 @@ import { Target, Folder, BarChart3, Settings, Shell } from 'lucide-react'
 // 前端内置兜底价格表，与 capturer.ts 中的 BUILTIN_MODEL_PRICING 保持一致
 // 当 preload 的 getModelPricing 不可用或 DB 无数据时作为兜底
 const FRONTEND_FALLBACK_PRICING: Record<string, { input: number; output: number }> = {
+  // OpenAI — GPT-5 系列
+  'gpt-5': { input: 1.25, output: 10 },
+  'gpt-5.4': { input: 2.5, output: 15 },
+  'gpt-5.4-mini': { input: 0.2, output: 0.8 },
+  // OpenAI — GPT-4 系列（仍在使用）
   'gpt-4o': { input: 2.5, output: 10 },
   'gpt-4o-mini': { input: 0.15, output: 0.6 },
-  'gpt-4-turbo': { input: 10, output: 30 },
-  'gpt-4': { input: 30, output: 60 },
-  'gpt-3.5-turbo': { input: 0.5, output: 1.5 },
-  'o1': { input: 15, output: 60 },
-  'o1-mini': { input: 3, output: 12 },
+  'gpt-4.1': { input: 2, output: 8 },
+  'gpt-4.1-mini': { input: 0.4, output: 1.6 },
+  'gpt-4.1-nano': { input: 0.1, output: 0.4 },
+  // OpenAI — 推理模型
+  'o3': { input: 10, output: 40 },
   'o3-mini': { input: 1.1, output: 4.4 },
-  'claude-3-5-sonnet-20241022': { input: 3, output: 15 },
-  'claude-3-5-haiku-20241022': { input: 0.8, output: 4 },
-  'claude-3-opus-20240229': { input: 15, output: 75 },
-  'claude-3-haiku-20240307': { input: 0.25, output: 1.25 },
-  'claude-4-5': { input: 3, output: 15 },
-  'claude-4-6': { input: 3, output: 15 },
-  'qwen-turbo': { input: 0.3, output: 0.6 },
-  'qwen-plus': { input: 0.8, output: 2 },
-  'qwen-max': { input: 2.4, output: 9.6 },
-  'qwen-long': { input: 0.07, output: 0.14 },
-  'qwen2.5-72b-instruct': { input: 0.56, output: 2.24 },
-  'qwen3.5-plus': { input: 0.004, output: 0.012 },
+  'o4-mini': { input: 1.1, output: 4.4 },
+  // Anthropic
+  'claude-sonnet-4.6': { input: 3, output: 15 },
+  'claude-sonnet-4.5': { input: 3, output: 15 },
+  'claude-opus-4.6': { input: 5, output: 25 },
+  'claude-haiku-4.5': { input: 1, output: 5 },
+  // Qwen（人民币转美元，按 7.2 汇率）
+  'qwen3-max': { input: 0.35, output: 1.33 },
+  'qwen3.5-plus': { input: 0.11, output: 0.33 },
+  'qwen-plus': { input: 0.11, output: 0.33 },
+  'qwen-turbo': { input: 0.04, output: 0.08 },
+  // DeepSeek
   'deepseek-chat': { input: 0.27, output: 1.1 },
   'deepseek-reasoner': { input: 0.55, output: 2.19 },
-  'gemini-1.5-pro': { input: 1.25, output: 5 },
-  'gemini-1.5-flash': { input: 0.075, output: 0.3 },
-  'gemini-2.0-flash': { input: 0.1, output: 0.4 },
+  // Google Gemini — 3 系列
+  'gemini-3.1-pro': { input: 2, output: 12 },
+  'gemini-3-pro': { input: 1.25, output: 10 },
+  'gemini-3-flash': { input: 0.5, output: 3 },
 }
 
 function getFallbackPricing(modelName: string): { input: number; output: number } | null {

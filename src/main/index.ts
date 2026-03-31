@@ -2,6 +2,7 @@ import { app, shell, BrowserWindow, ipcMain, systemPreferences, protocol, net, s
 import * as fs from 'fs'
 app.commandLine.appendSwitch('no-sandbox')
 import * as path from 'path'
+// import { exec } from 'child_process' // 已禁用测试通知，不再需要
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import OpenAI from 'openai'
@@ -15,6 +16,8 @@ import {
   stopSlotSummaryLoop,
   startDailyPricingLoop,
   stopDailyPricingLoop,
+  startInsightCacheLoop,
+  stopInsightCacheLoop,
   generateStatsInsight,
   setAppDataPath
 } from './capturer'
@@ -31,6 +34,83 @@ import {
   getDashboardUrl,
   GATEWAY_PORT_NUMBER
 } from './openclaw'
+import {
+  startTaskAbandonmentScanner,
+  stopTaskAbandonmentScanner,
+  triggerManualScan
+} from './taskAbandonmentScanner'
+
+// 测试通知定时器（已禁用，只保留真实的任务状态变更通知）
+// let testNotificationTimer: NodeJS.Timeout | null = null
+
+/**
+ * 启动测试通知定时器 - 每分钟发送一次系统通知
+ * 注：已禁用，只保留真实的任务状态变更通知
+ */
+/*
+function startTestNotificationTimer(): void {
+  if (testNotificationTimer) {
+    return
+  }
+
+  // 立即发送一次测试通知
+  sendTestNotification()
+
+  // 每 60 秒发送一次测试通知
+  testNotificationTimer = setInterval(() => {
+    sendTestNotification()
+  }, 60000)
+
+  console.log('[Test Notification] Timer started - will send notification every 60 seconds')
+}
+*/
+
+/**
+ * 停止测试通知定时器
+ * 注：已禁用
+ */
+/*
+function stopTestNotificationTimer(): void {
+  if (testNotificationTimer) {
+    clearInterval(testNotificationTimer)
+    testNotificationTimer = null
+    console.log('[Test Notification] Timer stopped')
+  }
+}
+*/
+
+/**
+ * 发送测试通知 - 使用 macOS 原生通知
+ * 注：已禁用
+ */
+/*
+function sendTestNotification(): void {
+  const now = new Date()
+  const timeString = now.toLocaleTimeString('zh-CN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  })
+
+  // 使用 macOS 的 osascript 命令发送系统通知
+  const title = '🔔 DoWhat 测试通知'
+  const message = `系统通知测试 - ${timeString}\n\n如果你看到这条通知，说明 macOS 系统通知功能正常工作！`
+
+  // 转义特殊字符
+  const escapedTitle = title.replace(/"/g, '\\"')
+  const escapedMessage = message.replace(/"/g, '\\"')
+
+  const script = `osascript -e 'display notification "${escapedMessage}" with title "${escapedTitle}" sound name "default"'`
+
+  exec(script, (error) => {
+    if (error) {
+      console.error(`[Test Notification] Failed to send notification:`, error)
+    } else {
+      console.log(`[Test Notification] Sent at ${timeString}`)
+    }
+  })
+}
+*/
 
 // 允许加载本地图片
 protocol.registerSchemesAsPrivileged([
@@ -251,16 +331,50 @@ app.whenReady().then(() => {
     return db.getContextsForDate(date)
   })
 
-  ipcMain.handle('get-backlog', () => {
-    return db.getBacklog()
+  ipcMain.handle('update-backlog-status', (_, id, completed) => {
+    db.updateBacklogStatus(id, completed)
   })
 
-  ipcMain.handle('update-backlog-status', (_, id, completed) => {
-    return db.updateBacklogStatus(id, completed)
+  ipcMain.handle('get-backlog', () => {
+    // 返回今日可见任务（跨日继承机制已在启动时将历史任务带入今日）
+    return db.getVisibleBacklog()
   })
 
   ipcMain.handle('get-visible-backlog', () => {
     return db.getVisibleBacklog()
+  })
+
+  ipcMain.handle('add-manual-task', (_, title: string, description?: string) => {
+    const taskId = `manual_task_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+    const today = new Date().toISOString().split('T')[0]
+
+    db.addBacklogItem({
+      id: taskId,
+      title: title.trim(),
+      description: description?.trim() || '',
+      progress: 0,
+      subtasks: '',
+      category: 'day',
+      priority: 3,
+      completed: false,
+      is_hidden: false,
+      is_abandoned: false,
+      task_date: today,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    })
+
+    console.log(`[Main] Manual task added: ${title}`)
+  })
+
+  ipcMain.handle('update-task', (_, id: string, title: string, description?: string) => {
+    db.updateBacklogItem(id, title, description)
+    console.log(`[Main] Task updated: ${id}`)
+  })
+
+  ipcMain.handle('reclassify-task', (_, id: string, category: string, priority: number) => {
+    db.reclassifyTask(id, category, priority)
+    console.log(`[Main] Task reclassified: ${id} → category=${category}, priority=${priority}`)
   })
 
   ipcMain.handle('get-projects', () => {
@@ -271,7 +385,19 @@ app.whenReady().then(() => {
     return db.getStatsSummary(start, end)
   })
 
-  ipcMain.handle('get-stats-insight', async (_, start, end) => {
+  ipcMain.handle('get-stats-insight', async (_, start, end, cycle?: string) => {
+    // 优先从缓存读取，如果缓存存在则直接返回
+    if (cycle) {
+      const cached = db.getInsightCache(cycle)
+      if (cached) {
+        return {
+          insight_text: cached.insight_text,
+          warning_text: cached.warning_text,
+          updated_at: cached.updated_at
+        }
+      }
+    }
+    // 缓存不存在时回退到实时生成
     return generateStatsInsight(start, end)
   })
 
@@ -313,11 +439,13 @@ app.whenReady().then(() => {
       startCaptureLoop(intervalMs)
       startSlotSummaryLoop()
       startDailyPricingLoop()
+      startInsightCacheLoop()
     } else {
       console.log('[Main] Stopping capture loop')
       stopCaptureLoop()
       stopSlotSummaryLoop()
       stopDailyPricingLoop()
+      stopInsightCacheLoop()
     }
   })
 
@@ -516,6 +644,11 @@ ${JSON.stringify(simplifiedContexts)}
     return getDashboardUrl()
   })
 
+  // IPC handler for task abandonment scanner
+  ipcMain.handle('trigger-task-scan', async () => {
+    return triggerManualScan()
+  })
+
   createWindow()
 
   // 应用启动时，若 AI 感知已开启则自动恢复捕获和槽摘要任务
@@ -527,10 +660,18 @@ ${JSON.stringify(simplifiedContexts)}
     startCaptureLoop(intervalMs)
     startSlotSummaryLoop()
     startDailyPricingLoop()
+    startInsightCacheLoop()
   }
 
   // 应用启动时，若 OpenClaw 已安装则自动启动 Gateway
   startGateway()
+
+  // 启动任务废弃扫描器（每分钟扫描一次）
+  startTaskAbandonmentScanner()
+
+  // 启动测试通知定时器（每分钟发送一次测试通知）
+  // 注释掉测试通知，只保留真实的任务状态变更通知
+  // startTestNotificationTimer()
 
   app.on('activate', function () {
     // On macOS it's common to re-create a window in the app when the
@@ -539,9 +680,14 @@ ${JSON.stringify(simplifiedContexts)}
   })
 })
 
-// 应用退出前关闭 OpenClaw Gateway
+// 应用退出前关闭 OpenClaw Gateway 和任务扫描器
 app.on('before-quit', () => {
   stopGateway()
+  stopTaskAbandonmentScanner()
+  // stopTestNotificationTimer() // 已注释掉测试通知
+  stopCaptureLoop()
+  stopSlotSummaryLoop()
+  stopDailyPricingLoop()
 })
 
 // Quit when all windows are closed, except on macOS. There, it's common

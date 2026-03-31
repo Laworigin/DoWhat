@@ -82,6 +82,13 @@ export function initDatabase(appDataPath?: string): void {
         output_price_per_1m REAL NOT NULL, -- 每百万 output token 的美元价格
         updated_at INTEGER NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS insight_cache (
+        cycle TEXT PRIMARY KEY,  -- 'day', 'week', 'month'
+        insight_text TEXT NOT NULL,
+        warning_text TEXT,
+        updated_at INTEGER NOT NULL
+      );
     `)
 
     // 迁移：为旧数据库添加缺失的字段
@@ -94,6 +101,15 @@ export function initDatabase(appDataPath?: string): void {
         console.log('[DB] Added priority column to backlog')
       } catch (e) {
         console.error('[DB] Failed to add priority column:', e)
+      }
+    }
+
+    if (!columns.includes('is_abandoned')) {
+      try {
+        db.exec('ALTER TABLE backlog ADD COLUMN is_abandoned INTEGER DEFAULT 0')
+        console.log('[DB] Added is_abandoned column to backlog')
+      } catch (e) {
+        console.error('[DB] Failed to add is_abandoned column:', e)
       }
     }
 
@@ -136,6 +152,15 @@ export function initDatabase(appDataPath?: string): void {
         console.log('[DB] Added description column to backlog')
       } catch (e) {
         console.error('[DB] Failed to add description column:', e)
+      }
+    }
+
+    if (!columns.includes('is_abandoned')) {
+      try {
+        db.exec('ALTER TABLE backlog ADD COLUMN is_abandoned INTEGER DEFAULT 0')
+        console.log('[DB] Added is_abandoned column to backlog')
+      } catch (e) {
+        console.error('[DB] Failed to add is_abandoned column:', e)
       }
     }
 
@@ -188,7 +213,8 @@ export function getContextsForDate(date: string): unknown[] {
 // Backlog 相关
 export function getBacklog(): unknown[] {
   if (!db) return []
-  return db.prepare('SELECT * FROM backlog ORDER BY created_at DESC').all()
+  // 过滤掉被标记为废弃/隐藏的任务 (is_hidden = 1)
+  return db.prepare('SELECT * FROM backlog WHERE is_hidden = 0 ORDER BY created_at DESC').all()
 }
 
 export function updateBacklogStatus(id: string, completed: boolean): void {
@@ -210,6 +236,39 @@ export function updateBacklogPriority(id: string, priority: number): void {
 export function hideBacklogItem(id: string, isHidden: boolean): void {
   if (!db) return
   db.prepare('UPDATE backlog SET is_hidden = ? WHERE id = ?').run(isHidden ? 1 : 0, id)
+}
+
+/**
+ * 标记任务为废弃状态（隐藏任务）
+ * 注意：同时隐藏该任务的所有跨日继承任务（通过 origin_id 关联）
+ */
+export function abandonBacklogItem(id: string, isAbandoned: boolean): void {
+  if (!db) return
+  const hiddenValue = isAbandoned ? 1 : 0
+
+  // 先查出该任务的 origin_id（如果有的话）
+  const task = db.prepare('SELECT origin_id FROM backlog WHERE id = ?').get(id) as { origin_id: string | null } | undefined
+  const trueOriginId = task?.origin_id ?? id
+
+  // 隐藏该任务本身
+  db.prepare('UPDATE backlog SET is_hidden = ? WHERE id = ?').run(hiddenValue, id)
+
+  // 同时隐藏所有以该任务为 origin 的继承任务（跨日继承的副本）
+  db.prepare('UPDATE backlog SET is_hidden = ? WHERE origin_id = ?').run(hiddenValue, id)
+
+  // 如果该任务本身是继承任务，也隐藏同一 origin 的所有兄弟继承任务
+  if (trueOriginId !== id) {
+    db.prepare('UPDATE backlog SET is_hidden = ? WHERE id = ? OR origin_id = ?').run(hiddenValue, trueOriginId, trueOriginId)
+  }
+}
+
+/**
+ * 重新分类任务（修改 category 和 priority）
+ * 用于拖拽调整任务分类
+ */
+export function reclassifyTask(id: string, category: string, priority: number): void {
+  if (!db) return
+  db.prepare('UPDATE backlog SET category = ?, priority = ? WHERE id = ?').run(category, priority, id)
 }
 
 // 项目相关
@@ -282,7 +341,20 @@ export function addBacklogItem(item: any): void {
 }
 
 /**
- * 获取今日可见任务列表（task_date = 今天，非隐藏）
+ * 更新任务的标题和描述
+ */
+export function updateBacklogItem(id: string, title: string, description?: string): void {
+  if (!db) return
+
+  db.prepare(
+    'UPDATE backlog SET title = ?, description = ? WHERE id = ?'
+  ).run(title.trim(), description?.trim() || '', id)
+
+  console.log(`[DB] Task updated: ${id}`)
+}
+
+/**
+ * 获取今日可见任务列表（task_date = 今天，非隐藏，非废弃）
  * 按优先级升序（1最高）、创建时间降序排列
  */
 export function getVisibleBacklog(): any[] {
@@ -290,6 +362,19 @@ export function getVisibleBacklog(): any[] {
   const today = new Date().toISOString().split('T')[0]
   return db.prepare(
     'SELECT * FROM backlog WHERE is_hidden = 0 AND task_date = ? ORDER BY priority ASC, created_at DESC'
+  ).all(today)
+}
+
+/**
+ * 获取今日待处理的任务（未完成、未隐藏、task_date = 今天）
+ * 用于定时扫描和 AI 去重判断
+ * 只扫描今日任务，避免处理大量历史任务导致去重效果差
+ */
+export function getPendingTasksForScan(): any[] {
+  if (!db) return []
+  const today = new Date().toISOString().split('T')[0]
+  return db.prepare(
+    'SELECT * FROM backlog WHERE completed = 0 AND is_hidden = 0 AND task_date = ? ORDER BY created_at DESC'
   ).all(today)
 }
 
@@ -375,20 +460,50 @@ export function inheritUnfinishedTasks(): number {
 }
 
 // 统计相关
+
+/**
+ * 根据截屏时间戳序列计算实际活跃分钟数
+ * 相邻截屏间隔 ≤ 2 分钟视为连续活跃，超过 2 分钟视为离开
+ */
+function calculateActiveMinutes(timestamps: number[]): number {
+  if (timestamps.length < 2) return timestamps.length > 0 ? 1 : 0
+
+  const maxGapMs = 2 * 60 * 1000
+  let totalActiveMs = 0
+
+  for (let i = 1; i < timestamps.length; i++) {
+    const gap = timestamps[i] - timestamps[i - 1]
+    if (gap <= maxGapMs) {
+      totalActiveMs += gap
+    }
+  }
+
+  return Math.round(totalActiveMs / 60000)
+}
+
 export function getStatsSummary(
   start: number,
   end: number
 ): {
   total_count: number
+  tagged_count: number
   top_intents: unknown[]
   flow_data: number[]
   context_switches: number
+  active_minutes: number
+  prev_active_minutes: number
+  prev_context_switches: number
 } | null {
   if (!db) return null
 
   // 计算总截屏数量
   const totalContexts = db
     .prepare('SELECT COUNT(*) as count FROM contexts WHERE timestamp >= ? AND timestamp <= ?')
+    .get(start, end) as { count: number }
+
+  // 计算有意图标签的截屏总数
+  const taggedContexts = db
+    .prepare("SELECT COUNT(*) as count FROM contexts WHERE timestamp >= ? AND timestamp <= ? AND intent_tags IS NOT NULL AND intent_tags != ''")
     .get(start, end) as { count: number }
 
   // 获取最常出现的意图分类
@@ -398,6 +513,7 @@ export function getStatsSummary(
     SELECT intent_tags, COUNT(*) as count
     FROM contexts
     WHERE timestamp >= ? AND timestamp <= ?
+      AND intent_tags IS NOT NULL AND intent_tags != ''
     GROUP BY intent_tags
     ORDER BY count DESC
     LIMIT 5
@@ -405,11 +521,12 @@ export function getStatsSummary(
     )
     .all(start, end)
 
-  // 计算上下文切换次数 (意图标签发生变化)
+  // 获取所有截屏时间戳，用于计算活跃时间和上下文切换
   const contexts = db
-    .prepare('SELECT intent_tags FROM contexts WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC')
-    .all(start, end) as { intent_tags: string }[]
+    .prepare('SELECT timestamp, intent_tags FROM contexts WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC')
+    .all(start, end) as { timestamp: number; intent_tags: string }[]
 
+  // 计算上下文切换次数
   let switches = 0
   for (let i = 1; i < contexts.length; i++) {
     if (contexts[i].intent_tags !== contexts[i - 1].intent_tags) {
@@ -417,23 +534,134 @@ export function getStatsSummary(
     }
   }
 
-  // 获取时间序列数据 (按小时或天分组，这里简单按 12 个时间点切分)
-  const interval = (end - start) / 12
-  const flowData: number[] = []
-  for (let i = 0; i < 12; i++) {
-    const tStart = start + i * interval
-    const tEnd = tStart + interval
-    const count = db
-      .prepare('SELECT COUNT(*) as count FROM contexts WHERE timestamp >= ? AND timestamp < ?')
-      .get(tStart, tEnd) as { count: number }
-    flowData.push(count.count)
+  // 计算实际活跃分钟数
+  const activeMinutes = calculateActiveMinutes(contexts.map((c) => c.timestamp))
+
+  // 计算上一周期的数据用于趋势对比
+  const periodLength = end - start
+  const prevStart = start - periodLength
+  const prevEnd = start
+
+  const prevContexts = db
+    .prepare('SELECT timestamp, intent_tags FROM contexts WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC')
+    .all(prevStart, prevEnd) as { timestamp: number; intent_tags: string }[]
+
+  const prevActiveMinutes = calculateActiveMinutes(prevContexts.map((c) => c.timestamp))
+
+  let prevSwitches = 0
+  for (let i = 1; i < prevContexts.length; i++) {
+    if (prevContexts[i].intent_tags !== prevContexts[i - 1].intent_tags) {
+      prevSwitches++
+    }
+  }
+
+  // 计算心流投入度时间序列
+  // 日报：按 24 小时制（每小时一个数据点）
+  // 周报/月报：按天（每天一个数据点）
+  const periodMs = end - start
+  const oneDayMs = 24 * 60 * 60 * 1000
+  const isDaily = periodMs <= oneDayMs * 1.5
+
+  let flowData: number[]
+
+  // 从 intent_tags JSON 中提取工作主题（前两个标签），用于判断是否切换了工作内容
+  // 例如 ["Chrome","HR政策发布平台","外籍津贴","报销指引","文档"] → "Chrome|HR政策发布平台"
+  function extractIntentTopic(intentTags: string): string {
+    try {
+      const tags = JSON.parse(intentTags)
+      if (Array.isArray(tags) && tags.length > 0) {
+        return tags.slice(0, 2).join('|')
+      }
+    } catch {
+      // JSON 解析失败，回退到原始字符串
+    }
+    return intentTags || ''
+  }
+
+  if (isDaily) {
+    // 日报模式：固定 24 个数据点（00:00-23:00），每小时一个投入度分数
+    const dayStart = new Date(start)
+    dayStart.setHours(0, 0, 0, 0)
+    const baseMs = dayStart.getTime()
+    const oneHourMs = 60 * 60 * 1000
+    // 活跃密度基准：200 条/小时（约每 18 秒一次截屏，代表高效工作状态）
+    const densityBaseline = 200
+
+    flowData = []
+    for (let hour = 0; hour < 24; hour++) {
+      const hourStart = baseMs + hour * oneHourMs
+      const hourEnd = hourStart + oneHourMs
+
+      const hourContexts = db
+        .prepare('SELECT timestamp, intent_tags FROM contexts WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp ASC')
+        .all(hourStart, hourEnd) as { timestamp: number; intent_tags: string }[]
+
+      if (hourContexts.length === 0) {
+        flowData.push(0)
+        continue
+      }
+
+      // 活跃密度分（0-100）：用平方根缩放，让中低截屏数也有合理分数
+      const densityScore = Math.min(100, Math.sqrt(hourContexts.length / densityBaseline) * 100)
+
+      // 专注连续性分（0-100）：基于工作主题（前两个标签）判断切换
+      let intentSwitches = 0
+      for (let j = 1; j < hourContexts.length; j++) {
+        if (extractIntentTopic(hourContexts[j].intent_tags) !== extractIntentTopic(hourContexts[j - 1].intent_tags)) {
+          intentSwitches++
+        }
+      }
+      const switchRate = hourContexts.length > 1 ? intentSwitches / (hourContexts.length - 1) : 0
+      const focusScore = (1 - switchRate) * 100
+
+      // 综合投入度 = 活跃密度 × 0.75 + 专注连续性 × 0.25
+      const engagementScore = Math.round(densityScore * 0.75 + focusScore * 0.25)
+      flowData.push(engagementScore)
+    }
+  } else {
+    // 周报/月报模式：按天切分
+    const days = Math.ceil(periodMs / oneDayMs)
+    // 每天密度基准：200 * 10 小时 = 2000 条/天
+    const densityBaselinePerDay = 2000
+    flowData = []
+    for (let d = 0; d < days; d++) {
+      const dayStartMs = start + d * oneDayMs
+      const dayEndMs = Math.min(dayStartMs + oneDayMs, end)
+
+      const dayContexts = db
+        .prepare('SELECT timestamp, intent_tags FROM contexts WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp ASC')
+        .all(dayStartMs, dayEndMs) as { timestamp: number; intent_tags: string }[]
+
+      if (dayContexts.length === 0) {
+        flowData.push(0)
+        continue
+      }
+
+      const densityScore = Math.min(100, Math.sqrt(dayContexts.length / densityBaselinePerDay) * 100)
+
+      let intentSwitches = 0
+      for (let j = 1; j < dayContexts.length; j++) {
+        if (extractIntentTopic(dayContexts[j].intent_tags) !== extractIntentTopic(dayContexts[j - 1].intent_tags)) {
+          intentSwitches++
+        }
+      }
+      const switchRate = dayContexts.length > 1 ? intentSwitches / (dayContexts.length - 1) : 0
+      const focusScore = (1 - switchRate) * 100
+
+      const engagementScore = Math.round(densityScore * 0.75 + focusScore * 0.25)
+      flowData.push(engagementScore)
+    }
   }
 
   return {
     total_count: totalContexts.count,
+    tagged_count: taggedContexts.count,
     top_intents: topIntents,
     flow_data: flowData,
-    context_switches: switches
+    context_switches: switches,
+    active_minutes: activeMinutes,
+    prev_active_minutes: prevActiveMinutes,
+    prev_context_switches: prevSwitches
   }
 }
 
@@ -564,4 +792,39 @@ export function getModelPricing(modelName: string): { input_price_per_1m: number
   return db
     .prepare('SELECT input_price_per_1m, output_price_per_1m, updated_at FROM model_pricing WHERE model_name = ?')
     .get(modelName) as { input_price_per_1m: number; output_price_per_1m: number; updated_at: number } | null
+}
+
+// Insight Cache 相关（持久化洞察报告缓存）
+export function upsertInsightCache(
+  cycle: string,
+  insightText: string,
+  warningText: string | null
+): void {
+  if (!db) return
+  db.prepare(`
+    INSERT INTO insight_cache (cycle, insight_text, warning_text, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(cycle) DO UPDATE SET
+      insight_text = excluded.insight_text,
+      warning_text = excluded.warning_text,
+      updated_at = excluded.updated_at
+  `).run(cycle, insightText, warningText, Date.now())
+}
+
+export function getInsightCache(cycle: string): { insight_text: string; warning_text: string | null; updated_at: number } | null {
+  if (!db) return null
+  return db
+    .prepare('SELECT insight_text, warning_text, updated_at FROM insight_cache WHERE cycle = ?')
+    .get(cycle) as { insight_text: string; warning_text: string | null; updated_at: number } | undefined ?? null
+}
+
+/**
+ * 获取指定时间范围内的 slot_summaries（15分钟槽归纳）
+ * 用于洞察报告生成
+ */
+export function getSlotSummariesInRange(startMs: number, endMs: number): { slot_start_ms: number; summary: string }[] {
+  if (!db) return []
+  return db
+    .prepare('SELECT slot_start_ms, summary FROM slot_summaries WHERE slot_start_ms >= ? AND slot_start_ms < ? ORDER BY slot_start_ms ASC')
+    .all(startMs, endMs) as { slot_start_ms: number; summary: string }[]
 }

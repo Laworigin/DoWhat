@@ -5,20 +5,28 @@ interface Window {
     getContexts: (date: string) => Promise<unknown[]>
     getBacklog: () => Promise<unknown[]>
     updateBacklogStatus: (id: string, completed: boolean) => Promise<void>
+    addManualTask: (title: string, description?: string) => Promise<void>
+    updateTask: (id: string, title: string, description?: string) => Promise<void>
+    reclassifyTask: (id: string, category: string, priority: number) => Promise<void>
     getProjects: () => Promise<unknown[]>
     getStatsSummary: (
       start: number,
       end: number
     ) => Promise<{
       total_count: number
-      top_intents: any[]
+      tagged_count: number
+      top_intents: { intent_tags: string; count: number }[]
       flow_data: number[]
       context_switches: number
+      active_minutes: number
+      prev_active_minutes: number
+      prev_context_switches: number
     }>
     getStatsInsight: (
       start: number,
-      end: number
-    ) => Promise<{ insight_text: string; warning_text?: string }>
+      end: number,
+      cycle?: string
+    ) => Promise<{ insight_text: string; warning_text?: string; updated_at?: number }>
     getMonthlyTokens: () => Promise<number>
     checkScreenPermission: () => Promise<string>
     openSystemPreferences: () => Promise<void>

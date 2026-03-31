@@ -90,35 +90,48 @@ const IntentBar: React.FC<{ label: string; percentage: number; color: string }> 
 
 interface StatsData {
   total_count: number
+  tagged_count: number
   top_intents: { intent_tags: string; count: number }[]
   flow_data: number[]
   context_switches: number
+  active_minutes: number
+  prev_active_minutes: number
+  prev_context_switches: number
 }
 
 export const StatsView: React.FC = () => {
   const [activeCycle, setActiveCycle] = useState<'day' | 'week' | 'month'>('week')
   const [stats, setStats] = useState<StatsData | null>(null)
-  const [insight, setInsight] = useState<{ insight_text: string; warning_text?: string } | null>(
+  const [insight, setInsight] = useState<{ insight_text: string; warning_text?: string; updated_at?: number } | null>(
     null
   )
   const [loadingInsight, setLoadingInsight] = useState(false)
+  const [hoveredPoint, setHoveredPoint] = useState<{ index: number; x: number; y: number; val: number; label: string } | null>(null)
 
   useEffect(() => {
     const loadStats = async (): Promise<void> => {
       const now = Date.now()
       const oneDay = 24 * 60 * 60 * 1000
-      let start = now - oneDay
+      let start: number
 
-      if (activeCycle === 'week') start = now - 7 * oneDay
-      if (activeCycle === 'month') start = now - 30 * oneDay
+      if (activeCycle === 'day') {
+        // 今日日报：从当天 00:00:00 开始
+        const today = new Date()
+        today.setHours(0, 0, 0, 0)
+        start = today.getTime()
+      } else if (activeCycle === 'week') {
+        start = now - 7 * oneDay
+      } else {
+        start = now - 30 * oneDay
+      }
 
       const data = (await window.api.getStatsSummary(start, now)) as StatsData
       setStats(data)
 
-      // 异步加载 AI 洞察
+      // 优先从缓存加载 AI 洞察（传入 cycle 参数）
       setLoadingInsight(true)
       try {
-        const insightData = await window.api.getStatsInsight(start, now)
+        const insightData = await window.api.getStatsInsight(start, now, activeCycle)
         setInsight(insightData)
       } catch (err) {
         console.error('Failed to load insight:', err)
@@ -132,10 +145,45 @@ export const StatsView: React.FC = () => {
   const exportLabel =
     activeCycle === 'day' ? '导出日报' : activeCycle === 'week' ? '导出周报' : '导出月报'
 
-  // 计算显示数值
-  const deepWorkHours = stats?.total_count ? Math.floor((stats.total_count * 5) / 60) : 0
-  const deepWorkMins = stats?.total_count ? (stats.total_count * 5) % 60 : 0
+  // 基于后端返回的实际活跃分钟数计算显示值
+  const deepWorkHours = stats?.active_minutes ? Math.floor(stats.active_minutes / 60) : 0
+  const deepWorkMins = stats?.active_minutes ? stats.active_minutes % 60 : 0
   const hasData = stats && stats.total_count > 0
+
+  // 计算趋势百分比（与上一周期对比）
+  const getWorkTrend = (): { text: string; type: 'up' | 'down' } => {
+    if (!stats || !stats.active_minutes) return { text: '暂无数据', type: 'up' }
+    if (!stats.prev_active_minutes) return { text: '无历史对比', type: 'up' }
+    const diff = ((stats.active_minutes - stats.prev_active_minutes) / stats.prev_active_minutes) * 100
+    const label = activeCycle === 'day' ? '较昨日' : activeCycle === 'week' ? '较上周' : '较上月'
+    if (diff >= 0) return { text: `+${Math.round(diff)}% ${label}`, type: 'up' }
+    return { text: `${Math.round(diff)}% ${label}`, type: 'down' }
+  }
+
+  const getSwitchTrend = (): { text: string; type: 'up' | 'down' } => {
+    if (!hasData) return { text: '暂无数据', type: 'up' }
+    // 基于有标签的截屏数计算专注度，避免大量无标签截屏稀释比例
+    const taggedBase = Math.max(stats.tagged_count || stats.total_count, 1)
+    const focusRate = 100 - Math.min(100, (stats.context_switches / taggedBase) * 100)
+    return { text: `专注度 ${Math.max(0, Math.round(focusRate))}%`, type: focusRate >= 50 ? 'up' : 'down' }
+  }
+
+  // 动态计算日期范围文本
+  const getDateRangeText = (): string => {
+    const now = new Date()
+    if (activeCycle === 'day') {
+      return now.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' })
+    }
+    if (activeCycle === 'week') {
+      const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)
+      const fmt = (d: Date): string => `${d.getMonth() + 1}月${d.getDate()}日`
+      return `${fmt(weekAgo)} - ${fmt(now)}, ${now.getFullYear()}`
+    }
+    return now.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long' })
+  }
+
+  const workTrend = getWorkTrend()
+  const switchTrend = getSwitchTrend()
 
   return (
     <div className="flex-1 flex h-full overflow-hidden bg-black/5 backdrop-blur-sm">
@@ -196,10 +244,9 @@ export const StatsView: React.FC = () => {
                   : activeCycle === 'week'
                     ? '本周效能复盘'
                     : '月度效能度量'}
-                舟
               </h1>
               <p className="text-[13px] text-gray-500 font-medium">
-                {activeCycle === 'week' ? 'Mar 18 - Mar 24, 2026' : 'March 2026'}
+                {getDateRangeText()}
               </p>
             </div>
             <button className="flex items-center gap-2 bg-white/10 hover:bg-white/15 text-white/90 text-[13px] font-bold px-4 py-2.5 rounded-xl border border-white/5 transition-all active:scale-95 shadow-lg">
@@ -220,16 +267,8 @@ export const StatsView: React.FC = () => {
               }
               value={`${deepWorkHours}`}
               unit={`h ${deepWorkMins} m`}
-              trend={
-                hasData
-                  ? activeCycle === 'day'
-                    ? '+20% 较昨日'
-                    : activeCycle === 'week'
-                      ? '+12% 较上周'
-                      : '+5% 较上月'
-                  : '暂无数据'
-              }
-              trendType="up"
+              trend={workTrend.text}
+              trendType={workTrend.type}
               icon={Zap}
               iconColor="text-green-400"
             />
@@ -237,12 +276,8 @@ export const StatsView: React.FC = () => {
               title="无效上下文切换"
               value={hasData ? `${stats.context_switches}` : '0'}
               unit="次"
-              trend={
-                hasData
-                  ? `专注度 ${(100 - Math.min(100, (stats.context_switches / (stats.total_count || 1)) * 100)).toFixed(0)}%`
-                  : '暂无数据'
-              }
-              trendType={hasData && stats.context_switches > 100 ? 'down' : 'up'}
+              trend={switchTrend.text}
+              trendType={switchTrend.type}
               icon={Shuffle}
               iconColor="text-red-400"
             />
@@ -277,7 +312,7 @@ export const StatsView: React.FC = () => {
               {/* Dynamic SVG Line Chart */}
               <div className="h-48 w-full relative">
                 {hasData ? (
-                  <svg className="w-full h-full" viewBox="0 0 400 100" preserveAspectRatio="none">
+                  <svg className="w-full h-full" viewBox="0 0 400 120">
                     <defs>
                       <linearGradient id="chartGradient" x1="0" y1="0" x2="0" y2="1">
                         <stop offset="0%" stopColor="#6366f1" stopOpacity="0.3" />
@@ -286,50 +321,148 @@ export const StatsView: React.FC = () => {
                     </defs>
                     {(() => {
                       const data = stats.flow_data || []
-                      const max = Math.max(...data, 1)
+                      const maxScore = 100
+                      const chartLeft = 35
+                      const chartRight = 395
+                      const chartWidth = chartRight - chartLeft
+                      const chartTop = 5
+                      const chartBottom = 95
+
                       const points = data.map((val: number, i: number) => {
-                        const x = (i / (data.length - 1)) * 400
-                        const y = 90 - (val / max) * 80 // 留出一点边距
-                        return { x, y }
+                        const x = chartLeft + (data.length > 1 ? (i / (data.length - 1)) * chartWidth : 0)
+                        const y = chartBottom - (val / maxScore) * (chartBottom - chartTop)
+                        return { x, y, val }
                       })
 
-                      // 构建平滑曲线路径
-                      let d = `M${points[0].x},${points[0].y}`
-                      for (let i = 0; i < points.length - 1; i++) {
-                        const p0 = points[i]
-                        const p1 = points[i + 1]
-                        const cpX = (p0.x + p1.x) / 2
-                        d += ` C${cpX},${p0.y} ${cpX},${p1.y} ${p1.x},${p1.y}`
-                      }
+                      // 用所有点构建完整曲线（包括值为 0 的点），保证时间轴连续
+                      const activePoints = points.filter((p) => p.val > 0)
 
-                      const fillPath = `${d} L400,100 L0,100 Z`
+                      let linePath = ''
+                      let fillPath = ''
+                      if (points.length > 0) {
+                        linePath = `M${points[0].x},${points[0].y}`
+                        for (let i = 0; i < points.length - 1; i++) {
+                          const p0 = points[i]
+                          const p1 = points[i + 1]
+                          const cpX = (p0.x + p1.x) / 2
+                          linePath += ` C${cpX},${p0.y} ${cpX},${p1.y} ${p1.x},${p1.y}`
+                        }
+                        fillPath = `${linePath} L${points[points.length - 1].x},${chartBottom} L${points[0].x},${chartBottom} Z`
+                      }
 
                       return (
                         <>
-                          <path
-                            d={fillPath}
-                            fill="url(#chartGradient)"
-                            className="transition-all duration-1000 ease-in-out"
-                          />
-                          <path
-                            d={d}
-                            fill="none"
-                            stroke="#6366f1"
-                            strokeWidth="2.5"
-                            strokeLinecap="round"
-                            className="transition-all duration-1000 ease-in-out"
-                          />
-                          {points.map((p: { x: number; y: number }, i: number) => (
-                            <circle
-                              key={i}
-                              cx={p.x}
-                              cy={p.y}
-                              r="3"
-                              fill="#6366f1"
-                              stroke="#000"
-                              strokeWidth="1"
+                          {/* Y 轴刻度线和标签 */}
+                          {[0, 25, 50, 75, 100].map((tick) => {
+                            const y = chartBottom - (tick / maxScore) * (chartBottom - chartTop)
+                            return (
+                              <g key={tick}>
+                                <line x1={chartLeft} y1={y} x2={chartRight} y2={y} stroke="rgba(255,255,255,0.06)" strokeWidth="0.5" strokeDasharray="3 3" />
+                                <text x={chartLeft - 5} y={y + 3} textAnchor="end" fill="rgba(255,255,255,0.3)" fontSize="8">{tick}</text>
+                              </g>
+                            )
+                          })}
+                          {/* X 轴基线 */}
+                          <line x1={chartLeft} y1={chartBottom} x2={chartRight} y2={chartBottom} stroke="rgba(255,255,255,0.1)" strokeWidth="0.5" />
+                          {fillPath && (
+                            <path
+                              d={fillPath}
+                              fill="url(#chartGradient)"
+                              className="transition-all duration-1000 ease-in-out"
                             />
-                          ))}
+                          )}
+                          {linePath && (
+                            <path
+                              d={linePath}
+                              fill="none"
+                              stroke="#6366f1"
+                              strokeWidth="2"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              className="transition-all duration-1000 ease-in-out"
+                            />
+                          )}
+                          {/* 只在有数据的小时画圆点，支持 hover tooltip */}
+                          {activePoints.map((p, i: number) => {
+                            // 计算该数据点在原始 data 数组中的索引
+                            const originalIndex = points.indexOf(p)
+                            // 生成 tooltip 标签
+                            let tooltipLabel = ''
+                            if (activeCycle === 'day') {
+                              tooltipLabel = `${String(originalIndex).padStart(2, '0')}:00`
+                            } else {
+                              const now = Date.now()
+                              const oneDay = 24 * 60 * 60 * 1000
+                              const periodStart = activeCycle === 'week' ? now - 7 * oneDay : now - 30 * oneDay
+                              const pointDate = new Date(periodStart + originalIndex * oneDay)
+                              tooltipLabel = `${pointDate.getMonth() + 1}月${pointDate.getDate()}日`
+                            }
+                            return (
+                              <g key={i}>
+                                <circle
+                                  cx={p.x}
+                                  cy={p.y}
+                                  r="3"
+                                  fill={hoveredPoint?.index === originalIndex ? '#818cf8' : '#6366f1'}
+                                  stroke="#1a1a2e"
+                                  strokeWidth="1.5"
+                                  className="cursor-pointer transition-all"
+                                />
+                                {/* 透明的更大热区，方便鼠标悬浮 */}
+                                <circle
+                                  cx={p.x}
+                                  cy={p.y}
+                                  r="8"
+                                  fill="transparent"
+                                  className="cursor-pointer"
+                                  onMouseEnter={() => setHoveredPoint({ index: originalIndex, x: p.x, y: p.y, val: p.val, label: tooltipLabel })}
+                                  onMouseLeave={() => setHoveredPoint(null)}
+                                />
+                              </g>
+                            )
+                          })}
+                          {/* Hover Tooltip */}
+                          {hoveredPoint && (
+                            <g>
+                              <rect
+                                x={hoveredPoint.x - 35}
+                                y={hoveredPoint.y - 28}
+                                width="70"
+                                height="22"
+                                rx="4"
+                                fill="rgba(0,0,0,0.85)"
+                                stroke="rgba(99,102,241,0.4)"
+                                strokeWidth="0.5"
+                              />
+                              <text x={hoveredPoint.x} y={hoveredPoint.y - 18} textAnchor="middle" fill="#e0e7ff" fontSize="7" fontWeight="bold">
+                                {hoveredPoint.label}
+                              </text>
+                              <text x={hoveredPoint.x} y={hoveredPoint.y - 10} textAnchor="middle" fill="#a5b4fc" fontSize="6">
+                                投入度 {hoveredPoint.val}
+                              </text>
+                            </g>
+                          )}
+                          {/* X 轴时间标签 */}
+                          {activeCycle === 'day' && [0, 4, 8, 12, 16, 20, 24].map((hour) => {
+                            const x = chartLeft + (hour / 23) * chartWidth
+                            return (
+                              <text key={hour} x={x} y={chartBottom + 14} textAnchor="middle" fill="rgba(255,255,255,0.3)" fontSize="8">
+                                {hour === 24 ? '24:00' : `${String(hour).padStart(2, '0')}:00`}
+                              </text>
+                            )
+                          })}
+                          {activeCycle === 'week' && ['周一', '周二', '周三', '周四', '周五', '周末'].map((label, i) => {
+                            const x = chartLeft + (i / 5) * chartWidth
+                            return (
+                              <text key={label} x={x} y={chartBottom + 14} textAnchor="middle" fill="rgba(255,255,255,0.3)" fontSize="8">{label}</text>
+                            )
+                          })}
+                          {activeCycle === 'month' && ['第一周', '第二周', '第三周', '第四周'].map((label, i) => {
+                            const x = chartLeft + (i / 3) * chartWidth
+                            return (
+                              <text key={label} x={x} y={chartBottom + 14} textAnchor="middle" fill="rgba(255,255,255,0.3)" fontSize="8">{label}</text>
+                            )
+                          })}
                         </>
                       )
                     })()}
@@ -354,33 +487,7 @@ export const StatsView: React.FC = () => {
                     </span>
                   </div>
                 )}
-                <div className="flex justify-between mt-4 px-1 text-[10px] text-gray-600 font-bold uppercase tracking-widest">
-                  {activeCycle === 'day' ? (
-                    <>
-                      <span>09:00</span>
-                      <span>12:00</span>
-                      <span>15:00</span>
-                      <span>18:00</span>
-                      <span>21:00</span>
-                    </>
-                  ) : activeCycle === 'week' ? (
-                    <>
-                      <span>周一</span>
-                      <span>周二</span>
-                      <span>周三</span>
-                      <span>周四</span>
-                      <span>周五</span>
-                      <span>周末</span>
-                    </>
-                  ) : (
-                    <>
-                      <span>第一周</span>
-                      <span>第二周</span>
-                      <span>第三周</span>
-                      <span>第四周</span>
-                    </>
-                  )}
-                </div>
+
               </div>
             </div>
 
@@ -390,22 +497,25 @@ export const StatsView: React.FC = () => {
               </h3>
               <div className="space-y-6">
                 {hasData && stats?.top_intents?.length > 0 ? (
-                  stats.top_intents.map((intent: { intent_tags: string; count: number }, i: number) => (
-                    <IntentBar
-                      key={i}
-                      label={JSON.parse(intent.intent_tags)[0]}
-                      percentage={Math.round((intent.count / stats.total_count) * 100)}
-                      color={
-                        [
-                          'bg-indigo-500',
-                          'bg-purple-500',
-                          'bg-pink-500',
-                          'bg-orange-500',
-                          'bg-green-500'
-                        ][i % 5]
-                      }
-                    />
-                  ))
+                  (() => {
+                    const intentTotalCount = stats.top_intents.reduce((sum: number, item: { count: number }) => sum + item.count, 0)
+                    return stats.top_intents.map((intent: { intent_tags: string; count: number }, i: number) => (
+                      <IntentBar
+                        key={i}
+                        label={JSON.parse(intent.intent_tags)[0]}
+                        percentage={Math.round((intent.count / Math.max(intentTotalCount, 1)) * 100)}
+                        color={
+                          [
+                            'bg-indigo-500',
+                            'bg-purple-500',
+                            'bg-pink-500',
+                            'bg-orange-500',
+                            'bg-green-500'
+                          ][i % 5]
+                        }
+                      />
+                    ))
+                  })()
                 ) : (
                   <div className="flex flex-col items-center justify-center h-32 text-gray-500 space-y-2">
                     <Code2 className="w-8 h-8 opacity-20" />
@@ -433,11 +543,15 @@ export const StatsView: React.FC = () => {
                     AI GENERATED
                   </span>
                 </div>
-                {loadingInsight && (
+                {loadingInsight ? (
                   <span className="text-[10px] text-indigo-400 font-bold animate-pulse">
                     正在分析深度数据...
                   </span>
-                )}
+                ) : insight?.updated_at ? (
+                  <span className="text-[10px] text-gray-500 font-medium">
+                    更新于 {new Date(insight.updated_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
+                  </span>
+                ) : null}
               </div>
               <div className="text-[14px] leading-relaxed text-gray-400 font-medium">
                 {loadingInsight ? (

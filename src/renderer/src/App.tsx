@@ -6,6 +6,7 @@ import { BacklogView } from './components/views/BacklogView'
 import { StatsView } from './components/views/StatsView'
 import { PermissionOverlay } from './components/PermissionOverlay'
 import { OpenClawView } from './components/views/OpenClawView'
+import { TaskNotification } from './components/TaskNotification'
 
 const MainLayout: React.FC<{ children: React.ReactNode }> = ({ children }) => (
   <div className="flex h-screen bg-black/40 backdrop-blur-3xl text-white font-sans antialiased select-none overflow-hidden relative">
@@ -71,6 +72,7 @@ function App(): React.ReactElement {
   return (
     <MainLayout>
       {!hasPermission && <PermissionOverlay onCheckAgain={checkPermission} />}
+      <TaskNotification />
       <PrimaryNav
         activeSection={activeSection}
         setActiveSection={setActiveSection}

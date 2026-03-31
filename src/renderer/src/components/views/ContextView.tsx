@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react'
-import { ChevronLeft, ChevronRight, Activity, Clock, PanelLeftClose, PanelLeftOpen, Layers, CheckCircle2, Circle, ChevronDown, ChevronUp, RefreshCcw } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Activity, Clock, PanelLeftClose, PanelLeftOpen, Layers, CheckCircle2, Circle, ChevronDown, ChevronUp, RefreshCcw, Plus, Pencil } from 'lucide-react'
 
 // ─── BacklogItem 数据模型 ───────────────────────────────────────────────────
 interface BacklogItem {
@@ -23,21 +23,32 @@ interface BacklogItem {
 interface PipelineItemProps {
   item: BacklogItem
   onToggle: (id: string, completed: boolean) => void
+  onEdit?: (item: BacklogItem) => void
   variant?: 'focus' | 'today' | 'backlog'
   isPromoted?: boolean
 }
 
-const PipelineItem: React.FC<PipelineItemProps> = ({ item, onToggle, variant = 'today', isPromoted }) => {
+const PipelineItem: React.FC<PipelineItemProps> = ({ item, onToggle, onEdit, variant = 'today', isPromoted }) => {
   const variantStyles = {
     focus: 'bg-red-500/8 border-red-500/25 hover:border-red-500/50',
     today: 'bg-indigo-500/5 border-indigo-500/20 hover:border-indigo-500/40 hover:bg-indigo-500/8',
     backlog: 'bg-white/[0.02] border-white/8 hover:border-white/15'
   }
 
+  const handleDragStart = (event: React.DragEvent<HTMLDivElement>): void => {
+    event.dataTransfer.setData('application/task-id', String(item.id))
+    event.dataTransfer.setData('application/task-category', item.category)
+    event.dataTransfer.setData('application/task-priority', String(item.priority ?? 3))
+    event.dataTransfer.effectAllowed = 'move'
+  }
+
   return (
     <div
+      draggable={!item.completed}
+      onDragStart={handleDragStart}
       className={`
         group p-3 rounded-xl border transition-all duration-300 relative overflow-hidden
+        ${!item.completed ? 'cursor-grab active:cursor-grabbing' : ''}
         ${item.completed ? 'bg-white/[0.02] border-white/5 opacity-50' : variantStyles[variant]}
       `}
     >
@@ -55,12 +66,23 @@ const PipelineItem: React.FC<PipelineItemProps> = ({ item, onToggle, variant = '
         <p className={`text-[12px] leading-snug flex-1 ${item.completed ? 'text-gray-500 line-through' : 'text-white'}`}>
           {item.title}
         </p>
-        <button
-          onClick={() => onToggle(String(item.id), !item.completed)}
-          className={`shrink-0 mt-0.5 transition-colors ${item.completed ? 'text-green-500' : 'text-gray-600 hover:text-indigo-400'}`}
-        >
-          {item.completed ? <CheckCircle2 className="w-4 h-4" /> : <Circle className="w-4 h-4" />}
-        </button>
+        <div className="flex items-center gap-1.5 shrink-0">
+          {!item.completed && onEdit && (
+            <button
+              onClick={() => onEdit(item)}
+              className="mt-0.5 text-gray-600 hover:text-blue-400 transition-colors"
+              title="编辑任务"
+            >
+              <Pencil className="w-3.5 h-3.5" />
+            </button>
+          )}
+          <button
+            onClick={() => onToggle(String(item.id), !item.completed)}
+            className={`mt-0.5 transition-colors ${item.completed ? 'text-green-500' : 'text-gray-600 hover:text-indigo-400'}`}
+          >
+            {item.completed ? <CheckCircle2 className="w-4 h-4" /> : <Circle className="w-4 h-4" />}
+          </button>
+        </div>
       </div>
 
       {/* 任务描述 */}
@@ -115,15 +137,114 @@ const SectionHeader: React.FC<SectionHeaderProps> = ({ label, count, dotColor, c
 // ─── PipelinePanel：四区分层面板（最高优先级 / 日常任务 / 待处理 / 已完成）───
 interface PipelinePanelProps {
   backlog: BacklogItem[]
+  slotSummaries: Map<number, string>
   onToggle: (id: string, completed: boolean) => void
+  onRefresh: () => void
 }
 
-const PipelinePanel: React.FC<PipelinePanelProps> = ({ backlog, onToggle }) => {
+const PipelinePanel: React.FC<PipelinePanelProps> = ({ backlog, slotSummaries, onToggle, onRefresh }) => {
   const [isHighPriorityCollapsed, setIsHighPriorityCollapsed] = useState(false)
   const [isDailyCollapsed, setIsDailyCollapsed] = useState(false)
   const [isBacklogCollapsed, setIsBacklogCollapsed] = useState(false)
   const [isCompletedCollapsed, setIsCompletedCollapsed] = useState(true)
   const [isBacklogExpanded, setIsBacklogExpanded] = useState(false)
+  const [showAddTaskDialog, setShowAddTaskDialog] = useState(false)
+  const [newTaskTitle, setNewTaskTitle] = useState('')
+  const [newTaskDescription, setNewTaskDescription] = useState('')
+  const [showEditTaskDialog, setShowEditTaskDialog] = useState(false)
+  const [editingTask, setEditingTask] = useState<BacklogItem | null>(null)
+  const [editTaskTitle, setEditTaskTitle] = useState('')
+  const [editTaskDescription, setEditTaskDescription] = useState('')
+  const [dragOverZone, setDragOverZone] = useState<string | null>(null)
+
+  const handleDragOver = (event: React.DragEvent<HTMLDivElement>): void => {
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'move'
+  }
+
+  const handleDragEnter = (zone: string) => (event: React.DragEvent<HTMLDivElement>): void => {
+    event.preventDefault()
+    setDragOverZone(zone)
+  }
+
+  const handleDragLeave = (event: React.DragEvent<HTMLDivElement>): void => {
+    const relatedTarget = event.relatedTarget as Node | null
+    if (!event.currentTarget.contains(relatedTarget)) {
+      setDragOverZone(null)
+    }
+  }
+
+  const handleDrop = (targetZone: string) => async (event: React.DragEvent<HTMLDivElement>): Promise<void> => {
+    event.preventDefault()
+    setDragOverZone(null)
+
+    const taskId = event.dataTransfer.getData('application/task-id')
+    if (!taskId) return
+
+    let newCategory: string
+    let newPriority: number
+
+    switch (targetZone) {
+      case 'high-priority':
+        newCategory = event.dataTransfer.getData('application/task-category') || 'backlog'
+        newPriority = 1
+        break
+      case 'daily':
+        newCategory = 'day'
+        newPriority = 3
+        break
+      case 'backlog':
+        newCategory = 'backlog'
+        newPriority = 3
+        break
+      default:
+        return
+    }
+
+    await window.api.reclassifyTask(taskId, newCategory, newPriority)
+    await onRefresh()
+  }
+
+  const dropZoneHighlight = (zone: string): string =>
+    dragOverZone === zone ? 'ring-2 ring-offset-1 ring-offset-transparent rounded-xl transition-all duration-200' : ''
+
+  const dropZoneRingColor: Record<string, string> = {
+    'high-priority': 'ring-red-500/60',
+    daily: 'ring-indigo-500/60',
+    backlog: 'ring-amber-500/60'
+  }
+
+  const handleAddTask = async (): Promise<void> => {
+    if (!newTaskTitle.trim()) return
+
+    await window.api.addManualTask(newTaskTitle.trim(), newTaskDescription.trim() || undefined)
+    setShowAddTaskDialog(false)
+    setNewTaskTitle('')
+    setNewTaskDescription('')
+    await onRefresh()
+  }
+
+  const handleEditTask = (item: BacklogItem): void => {
+    setEditingTask(item)
+    setEditTaskTitle(item.title)
+    setEditTaskDescription(item.description || '')
+    setShowEditTaskDialog(true)
+  }
+
+  const handleUpdateTask = async (): Promise<void> => {
+    if (!editingTask || !editTaskTitle.trim()) return
+
+    await window.api.updateTask(
+      String(editingTask.id),
+      editTaskTitle.trim(),
+      editTaskDescription.trim() || undefined
+    )
+    setShowEditTaskDialog(false)
+    setEditingTask(null)
+    setEditTaskTitle('')
+    setEditTaskDescription('')
+    await onRefresh()
+  }
 
   const activeTasks = backlog.filter((item) => !item.completed)
   const completedTasks = backlog.filter((item) => item.completed)
@@ -138,9 +259,10 @@ const PipelinePanel: React.FC<PipelinePanelProps> = ({ backlog, onToggle }) => {
     .filter((item) => item.category === 'day' && item.priority !== 1)
     .sort((a, b) => (a.priority ?? 3) - (b.priority ?? 3))
 
-  // 待处理：category === 'backlog' 且非最高优先级，按优先级+时间排序
+  // 待处理：category 为 'backlog'/'week'/'month' 且非最高优先级，按优先级+时间排序
+  const backlogCategories = new Set(['backlog', 'week', 'month'])
   const backlogTasks = activeTasks
-    .filter((item) => item.category === 'backlog' && item.priority !== 1)
+    .filter((item) => backlogCategories.has(item.category?.toLowerCase() ?? '') && item.priority !== 1)
     .sort((a, b) => {
       const priorityDiff = (a.priority ?? 3) - (b.priority ?? 3)
       if (priorityDiff !== 0) return priorityDiff
@@ -152,38 +274,64 @@ const PipelinePanel: React.FC<PipelinePanelProps> = ({ backlog, onToggle }) => {
   return (
     <div className="space-y-4">
       {/* ── 最高优先级 ── */}
-      {highPriorityTasks.length > 0 && (
-        <div>
-          <SectionHeader
-            label="🔥 最高优先级"
-            count={highPriorityTasks.length}
-            dotColor="bg-red-500"
-            collapsed={isHighPriorityCollapsed}
-            onToggleCollapse={() => setIsHighPriorityCollapsed((prev) => !prev)}
-          />
-          {!isHighPriorityCollapsed && (
-            <div className="space-y-2">
-              {highPriorityTasks.map((item) => (
-                <PipelineItem key={item.id} item={item} onToggle={onToggle} variant="focus" />
-              ))}
-            </div>
-          )}
-        </div>
-      )}
+      <div
+        onDragOver={handleDragOver}
+        onDragEnter={handleDragEnter('high-priority')}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop('high-priority')}
+        className={`p-2 -m-2 ${dropZoneHighlight('high-priority')} ${dropZoneRingColor['high-priority'] ?? ''}`}
+      >
+        <SectionHeader
+          label="🔥 最高优先级"
+          count={highPriorityTasks.length}
+          dotColor="bg-red-500"
+          collapsed={isHighPriorityCollapsed}
+          onToggleCollapse={() => setIsHighPriorityCollapsed((prev) => !prev)}
+        />
+        {!isHighPriorityCollapsed && (
+          <div className="space-y-2">
+            {highPriorityTasks.map((item) => (
+              <PipelineItem key={item.id} item={item} onToggle={onToggle} onEdit={handleEditTask} variant="focus" />
+            ))}
+            {highPriorityTasks.length === 0 && dragOverZone !== 'high-priority' && (
+              <div className="py-3 text-center border border-dashed border-white/5 rounded-xl">
+                <p className="text-[10px] text-gray-600 font-bold tracking-widest">
+                  拖拽任务到此处设为最高优先级
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
 
       {/* ── 日常任务 ── */}
-      <div>
-        <SectionHeader
-          label="📋 日常任务"
-          count={dailyTasks.length}
-          dotColor="bg-indigo-500"
-          collapsed={isDailyCollapsed}
-          onToggleCollapse={() => setIsDailyCollapsed((prev) => !prev)}
-        />
+      <div
+        onDragOver={handleDragOver}
+        onDragEnter={handleDragEnter('daily')}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop('daily')}
+        className={`p-2 -m-2 ${dropZoneHighlight('daily')} ${dropZoneRingColor['daily'] ?? ''}`}
+      >
+        <div className="flex items-center gap-2 mb-2">
+          <SectionHeader
+            label="📋 日常任务"
+            count={dailyTasks.length}
+            dotColor="bg-indigo-500"
+            collapsed={isDailyCollapsed}
+            onToggleCollapse={() => setIsDailyCollapsed((prev) => !prev)}
+          />
+          <button
+            onClick={() => setShowAddTaskDialog(true)}
+            className="p-1 hover:bg-white/10 rounded-lg text-gray-500 hover:text-indigo-400 transition-colors"
+            title="添加任务"
+          >
+            <Plus className="w-3.5 h-3.5" />
+          </button>
+        </div>
         {!isDailyCollapsed && (
           <div className="space-y-2">
             {dailyTasks.map((item) => (
-              <PipelineItem key={item.id} item={item} onToggle={onToggle} variant="today" />
+              <PipelineItem key={item.id} item={item} onToggle={onToggle} onEdit={handleEditTask} variant="today" />
             ))}
             {dailyTasks.length === 0 && (
               <div className="py-6 text-center border border-dashed border-white/5 rounded-xl">
@@ -197,64 +345,233 @@ const PipelinePanel: React.FC<PipelinePanelProps> = ({ backlog, onToggle }) => {
       </div>
 
       {/* ── 待处理 ── */}
-      {backlogTasks.length > 0 && (
-        <div>
-          <SectionHeader
-            label="📥 待处理"
-            count={backlogTasks.length}
-            dotColor="bg-amber-500"
-            collapsed={isBacklogCollapsed}
-            onToggleCollapse={() => setIsBacklogCollapsed((prev) => !prev)}
-          />
-          {!isBacklogCollapsed && (
-            <>
-              <div className="space-y-2">
-                {visibleBacklogTasks.map((item) => (
-                  <PipelineItem key={item.id} item={item} onToggle={onToggle} variant="backlog" />
-                ))}
-              </div>
-              {backlogTasks.length > 5 && (
-                <button
-                  onClick={() => setIsBacklogExpanded((prev) => !prev)}
-                  className="mt-2 w-full py-1.5 flex items-center justify-center gap-1.5 text-[9px] font-black text-gray-500 hover:text-gray-300 tracking-widest transition-colors"
-                >
-                  {isBacklogExpanded ? (
-                    <><ChevronUp className="w-3 h-3" /> 收起</>
-                  ) : (
-                    <><ChevronDown className="w-3 h-3" /> 查看全部 {backlogTasks.length} 条</>
-                  )}
-                </button>
+      <div
+        onDragOver={handleDragOver}
+        onDragEnter={handleDragEnter('backlog')}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop('backlog')}
+        className={`p-2 -m-2 ${dropZoneHighlight('backlog')} ${dropZoneRingColor['backlog'] ?? ''}`}
+      >
+        <SectionHeader
+          label="📥 待处理"
+          count={backlogTasks.length}
+          dotColor="bg-amber-500"
+          collapsed={isBacklogCollapsed}
+          onToggleCollapse={() => setIsBacklogCollapsed((prev) => !prev)}
+        />
+        {!isBacklogCollapsed && (
+          <>
+            <div className="space-y-2">
+              {visibleBacklogTasks.map((item) => (
+                <PipelineItem key={item.id} item={item} onToggle={onToggle} onEdit={handleEditTask} variant="backlog" />
+              ))}
+              {backlogTasks.length === 0 && (
+                <div className="py-3 text-center border border-dashed border-white/5 rounded-xl">
+                  <p className="text-[10px] text-gray-600 font-bold tracking-widest">
+                    暂无待处理任务
+                  </p>
+                </div>
               )}
-            </>
-          )}
-        </div>
-      )}
+            </div>
+            {backlogTasks.length > 5 && (
+              <button
+                onClick={() => setIsBacklogExpanded((prev) => !prev)}
+                className="mt-2 w-full py-1.5 flex items-center justify-center gap-1.5 text-[9px] font-black text-gray-500 hover:text-gray-300 tracking-widest transition-colors"
+              >
+                {isBacklogExpanded ? (
+                  <><ChevronUp className="w-3 h-3" /> 收起</>
+                ) : (
+                  <><ChevronDown className="w-3 h-3" /> 查看全部 {backlogTasks.length} 条</>
+                )}
+              </button>
+            )}
+          </>
+        )}
+      </div>
 
       {/* ── 已完成 ── */}
-      {completedTasks.length > 0 && (
-        <div className="pt-2 border-t border-white/5">
-          <SectionHeader
-            label="✅ 已完成"
-            count={completedTasks.length}
-            dotColor="bg-green-500"
-            collapsed={isCompletedCollapsed}
-            onToggleCollapse={() => setIsCompletedCollapsed((prev) => !prev)}
-          />
-          {!isCompletedCollapsed && (
-            <div className="space-y-1.5">
-              {completedTasks.map((item) => (
-                <PipelineItem key={item.id} item={item} onToggle={onToggle} variant="today" />
-              ))}
-            </div>
-          )}
-        </div>
-      )}
+      {(() => {
+        // 从 slotSummaries 提取去重的已完成事项
+        const completedActivities: { title: string; description: string; time: string }[] = []
+        const seenTitles = new Set<string>()
+        const sortedSlots = Array.from(slotSummaries.entries()).sort((a, b) => a[0] - b[0])
+        for (const [slotMs, summaryJson] of sortedSlots) {
+          try {
+            const parsed = JSON.parse(summaryJson)
+            const title = parsed.title || ''
+            if (title && !seenTitles.has(title)) {
+              seenTitles.add(title)
+              const slotTime = new Date(slotMs)
+              const timeStr = `${String(slotTime.getHours()).padStart(2, '0')}:${String(slotTime.getMinutes()).padStart(2, '0')}`
+              completedActivities.push({ title, description: parsed.description || '', time: timeStr })
+            }
+          } catch { /* skip non-JSON */ }
+        }
+        const totalCompleted = completedTasks.length + completedActivities.length
+
+        return (
+          <div className="pt-2 border-t border-white/5">
+            <SectionHeader
+              label="✅ 已完成"
+              count={totalCompleted}
+              dotColor="bg-green-500"
+              collapsed={isCompletedCollapsed}
+              onToggleCollapse={() => setIsCompletedCollapsed((prev) => !prev)}
+            />
+            {!isCompletedCollapsed && (
+              <div className="space-y-1.5">
+                {/* 手动标记完成的 backlog 任务 */}
+                {completedTasks.map((item) => (
+                  <PipelineItem key={item.id} item={item} onToggle={onToggle} onEdit={handleEditTask} variant="today" />
+                ))}
+                {/* AI 识别的已完成活动 */}
+                {completedActivities.map((activity, index) => (
+                  <div key={`activity-${index}`} className="px-3 py-2.5 rounded-lg bg-white/[0.03] border border-white/5 group">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="text-green-500 text-[10px]">✓</span>
+                        <span className="text-[12px] text-gray-400 font-medium truncate">{activity.title}</span>
+                      </div>
+                      <span className="text-[10px] text-gray-600 font-mono shrink-0 ml-2">{activity.time}</span>
+                    </div>
+                    {activity.description && (
+                      <p className="text-[10px] text-gray-600 mt-1 ml-5 line-clamp-1">{activity.description}</p>
+                    )}
+                  </div>
+                ))}
+                {totalCompleted === 0 && (
+                  <div className="py-6 text-center border border-dashed border-white/5 rounded-xl">
+                    <p className="text-[10px] text-gray-600 font-bold tracking-widest">
+                      今日暂无已完成任务
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )
+      })()}
 
       {backlog.length === 0 && (
         <div className="py-10 text-center border-2 border-dashed border-white/5 rounded-2xl">
           <p className="text-[11px] text-gray-500 font-bold tracking-widest italic">
             等待 AI 发现第一个任务...
           </p>
+        </div>
+      )}
+
+      {/* ── 添加任务对话框 ── */}
+      {showAddTaskDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md">
+          <div className="w-[320px] bg-gray-900/95 border border-white/20 rounded-2xl p-4 shadow-2xl backdrop-blur-xl">
+            <h3 className="text-[13px] font-black text-white tracking-tight mb-4">
+              添加新任务
+            </h3>
+            <div className="space-y-3">
+              <div>
+                <label className="block text-[10px] font-bold text-gray-400 mb-1.5">
+                  任务标题 <span className="text-red-400">*</span>
+                </label>
+                <input
+                  type="text"
+                  value={newTaskTitle}
+                  onChange={(e) => setNewTaskTitle(e.target.value)}
+                  placeholder="输入任务标题..."
+                  className="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[11px] text-white placeholder-gray-600 focus:outline-none focus:border-indigo-500/50 transition-colors"
+                  autoFocus
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] font-bold text-gray-400 mb-1.5">
+                  任务描述 <span className="text-gray-600">(可选)</span>
+                </label>
+                <textarea
+                  value={newTaskDescription}
+                  onChange={(e) => setNewTaskDescription(e.target.value)}
+                  placeholder="输入任务描述..."
+                  rows={3}
+                  className="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[11px] text-white placeholder-gray-600 focus:outline-none focus:border-indigo-500/50 transition-colors resize-none"
+                />
+              </div>
+              <div className="flex gap-2 pt-2">
+                <button
+                  onClick={() => {
+                    setShowAddTaskDialog(false)
+                    setNewTaskTitle('')
+                    setNewTaskDescription('')
+                  }}
+                  className="flex-1 py-2 px-3 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-[10px] font-bold text-gray-400 hover:text-white transition-colors"
+                >
+                  取消
+                </button>
+                <button
+                  onClick={handleAddTask}
+                  disabled={!newTaskTitle.trim()}
+                  className="flex-1 py-2 px-3 bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-500/30 rounded-lg text-[10px] font-bold text-indigo-400 hover:text-indigo-300 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  确认添加
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── 编辑任务对话框 ── */}
+      {showEditTaskDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md">
+          <div className="w-[320px] bg-gray-900/95 border border-white/20 rounded-2xl p-4 shadow-2xl backdrop-blur-xl">
+            <h3 className="text-[13px] font-black text-white tracking-tight mb-4">
+              编辑任务
+            </h3>
+            <div className="space-y-3">
+              <div>
+                <label className="block text-[10px] font-bold text-gray-400 mb-1.5">
+                  任务标题 <span className="text-red-400">*</span>
+                </label>
+                <input
+                  type="text"
+                  value={editTaskTitle}
+                  onChange={(e) => setEditTaskTitle(e.target.value)}
+                  placeholder="输入任务标题..."
+                  className="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[11px] text-white placeholder-gray-600 focus:outline-none focus:border-indigo-500/50 transition-colors"
+                  autoFocus
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] font-bold text-gray-400 mb-1.5">
+                  任务描述 <span className="text-gray-600">(可选)</span>
+                </label>
+                <textarea
+                  value={editTaskDescription}
+                  onChange={(e) => setEditTaskDescription(e.target.value)}
+                  placeholder="输入任务描述..."
+                  rows={3}
+                  className="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-[11px] text-white placeholder-gray-600 focus:outline-none focus:border-indigo-500/50 transition-colors resize-none"
+                />
+              </div>
+              <div className="flex gap-2 pt-2">
+                <button
+                  onClick={() => {
+                    setShowEditTaskDialog(false)
+                    setEditingTask(null)
+                    setEditTaskTitle('')
+                    setEditTaskDescription('')
+                  }}
+                  className="flex-1 py-2 px-3 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-[10px] font-bold text-gray-400 hover:text-white transition-colors"
+                >
+                  取消
+                </button>
+                <button
+                  onClick={handleUpdateTask}
+                  disabled={!editTaskTitle.trim()}
+                  className="flex-1 py-2 px-3 bg-indigo-500/20 hover:bg-indigo-500/30 border border-indigo-500/30 rounded-lg text-[10px] font-bold text-indigo-400 hover:text-indigo-300 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  确认修改
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </div>
@@ -967,8 +1284,12 @@ export const ContextView: React.FC = () => {
           {/* Today's Pipeline (三区分层：FOCUS / TODAY / BACKLOG) */}
           <PipelinePanel
             backlog={backlog}
+            slotSummaries={slotSummaries}
             onToggle={async (id, completed) => {
               await window.api.updateBacklogStatus(id, completed)
+              await loadBacklog()
+            }}
+            onRefresh={async () => {
               await loadBacklog()
             }}
           />
