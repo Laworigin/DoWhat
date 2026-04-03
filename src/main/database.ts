@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3'
+import * as fs from 'fs'
 import * as path from 'path'
 
 let db: Database.Database
@@ -13,7 +14,7 @@ export function initDatabase(appDataPath?: string): void {
 
     console.log('[DB] Using database path:', dbPath)
 
-    db = new Database(dbPath, { verbose: console.log })
+    db = new Database(dbPath)
 
     db.exec(`
       CREATE TABLE IF NOT EXISTS settings (
@@ -88,6 +89,13 @@ export function initDatabase(appDataPath?: string): void {
         insight_text TEXT NOT NULL,
         warning_text TEXT,
         updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS daily_reports (
+        date TEXT PRIMARY KEY,          -- YYYY-MM-DD
+        insight_text TEXT NOT NULL,
+        warning_text TEXT,
+        generated_at INTEGER NOT NULL   -- 生成时间戳（毫秒）
       );
     `)
 
@@ -164,6 +172,31 @@ export function initDatabase(appDataPath?: string): void {
       }
     }
 
+    if (!columns.includes('completed_by')) {
+      try {
+        db.exec("ALTER TABLE backlog ADD COLUMN completed_by TEXT DEFAULT NULL")
+        console.log('[DB] Added completed_by column to backlog')
+      } catch (e) {
+        console.error('[DB] Failed to add completed_by column:', e)
+      }
+    }
+
+    // Performance: add indexes for frequently queried timestamp columns
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_contexts_timestamp ON contexts(timestamp);
+      CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp);
+      CREATE INDEX IF NOT EXISTS idx_summaries_timestamp ON summaries(timestamp);
+      CREATE INDEX IF NOT EXISTS idx_slot_summaries_date ON slot_summaries(date);
+      CREATE INDEX IF NOT EXISTS idx_backlog_task_date ON backlog(task_date);
+    `)
+
+    // Performance: optimize WAL mode and memory usage
+    db.pragma('journal_mode = WAL')
+    db.pragma('cache_size = -2000')
+
+    // Auto-cleanup: remove data older than 30 days to prevent database bloat
+    cleanupOldData()
+
     console.log(`[DB] Database initialized successfully at: ${dbPath}`)
   } catch (error) {
     console.error('[DB] Database initialization failed:', error)
@@ -204,22 +237,33 @@ export function getContextsForDate(date: string): unknown[] {
   const startOfDay = new Date(date).setHours(0, 0, 0, 0)
   const endOfDay = new Date(date).setHours(23, 59, 59, 999)
 
+  // Select fields needed for list rendering (image_local_path is a lightweight path string, needed for thumbnails)
   const stmt = db.prepare(
-    'SELECT * FROM contexts WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp DESC'
+    'SELECT id, timestamp, image_local_path, ai_summary, intent_tags FROM contexts WHERE timestamp >= ? AND timestamp <= ? ORDER BY timestamp DESC'
   )
   return stmt.all(startOfDay, endOfDay)
+}
+
+/**
+ * Get full context detail including image_local_path (on-demand, for detail panel)
+ */
+export function getContextDetail(contextId: number): unknown | null {
+  if (!db) return null
+  return db.prepare('SELECT * FROM contexts WHERE id = ?').get(contextId) ?? null
 }
 
 // Backlog 相关
 export function getBacklog(): unknown[] {
   if (!db) return []
-  // 过滤掉被标记为废弃/隐藏的任务 (is_hidden = 1)
-  return db.prepare('SELECT * FROM backlog WHERE is_hidden = 0 ORDER BY created_at DESC').all()
+  // 过滤掉被标记为废弃/隐藏的任务 (is_hidden = 1 或 is_abandoned = 1)
+  return db.prepare('SELECT * FROM backlog WHERE is_hidden = 0 AND is_abandoned = 0 ORDER BY created_at DESC').all()
 }
 
-export function updateBacklogStatus(id: string, completed: boolean): void {
+export function updateBacklogStatus(id: string, completed: boolean, completedBy?: 'manual' | 'ai'): void {
   if (!db) return
-  db.prepare('UPDATE backlog SET completed = ? WHERE id = ?').run(completed ? 1 : 0, id)
+  const completedValue = completed ? 1 : 0
+  const completedByValue = completed ? (completedBy ?? 'manual') : null
+  db.prepare('UPDATE backlog SET completed = ?, completed_by = ? WHERE id = ?').run(completedValue, completedByValue, id)
 }
 
 /**
@@ -244,21 +288,21 @@ export function hideBacklogItem(id: string, isHidden: boolean): void {
  */
 export function abandonBacklogItem(id: string, isAbandoned: boolean): void {
   if (!db) return
-  const hiddenValue = isAbandoned ? 1 : 0
+  const flagValue = isAbandoned ? 1 : 0
 
   // 先查出该任务的 origin_id（如果有的话）
   const task = db.prepare('SELECT origin_id FROM backlog WHERE id = ?').get(id) as { origin_id: string | null } | undefined
   const trueOriginId = task?.origin_id ?? id
 
-  // 隐藏该任务本身
-  db.prepare('UPDATE backlog SET is_hidden = ? WHERE id = ?').run(hiddenValue, id)
+  // 同时设置 is_hidden 和 is_abandoned，确保废弃任务在所有视图中不可见
+  db.prepare('UPDATE backlog SET is_hidden = ?, is_abandoned = ? WHERE id = ?').run(flagValue, flagValue, id)
 
-  // 同时隐藏所有以该任务为 origin 的继承任务（跨日继承的副本）
-  db.prepare('UPDATE backlog SET is_hidden = ? WHERE origin_id = ?').run(hiddenValue, id)
+  // 同时处理所有以该任务为 origin 的继承任务（跨日继承的副本）
+  db.prepare('UPDATE backlog SET is_hidden = ?, is_abandoned = ? WHERE origin_id = ?').run(flagValue, flagValue, id)
 
-  // 如果该任务本身是继承任务，也隐藏同一 origin 的所有兄弟继承任务
+  // 如果该任务本身是继承任务，也处理同一 origin 的所有兄弟继承任务
   if (trueOriginId !== id) {
-    db.prepare('UPDATE backlog SET is_hidden = ? WHERE id = ? OR origin_id = ?').run(hiddenValue, trueOriginId, trueOriginId)
+    db.prepare('UPDATE backlog SET is_hidden = ?, is_abandoned = ? WHERE id = ? OR origin_id = ?').run(flagValue, flagValue, trueOriginId, trueOriginId)
   }
 }
 
@@ -506,7 +550,7 @@ export function getStatsSummary(
     .prepare("SELECT COUNT(*) as count FROM contexts WHERE timestamp >= ? AND timestamp <= ? AND intent_tags IS NOT NULL AND intent_tags != ''")
     .get(start, end) as { count: number }
 
-  // 获取最常出现的意图分类
+  // 获取最常出现的意图分类（返回原始 intent_tags，前端负责提取第一个标签并合并去重）
   const topIntents = db
     .prepare(
       `
@@ -516,7 +560,7 @@ export function getStatsSummary(
       AND intent_tags IS NOT NULL AND intent_tags != ''
     GROUP BY intent_tags
     ORDER BY count DESC
-    LIMIT 5
+    LIMIT 20
   `
     )
     .all(start, end)
@@ -715,8 +759,49 @@ export function getLatestSummary(level: number): { content: string; timestamp: n
 export function getContextsSince(timestamp: number): unknown[] {
   if (!db) return []
   return db
-    .prepare('SELECT * FROM contexts WHERE timestamp >= ? ORDER BY timestamp ASC')
+    .prepare('SELECT id, timestamp, ai_summary, intent_tags FROM contexts WHERE timestamp >= ? ORDER BY timestamp ASC')
     .all(timestamp)
+}
+
+/**
+ * 搜索 contexts 表中 ai_summary 包含指定关键词的记录
+ * 用于主动扫描历史截图中的 OKR 内容
+ * 按时间倒序返回，优先返回最近的匹配
+ */
+export function searchContextsByKeywords(keywords: string[], limit: number = 10): { id: number; timestamp: number; ai_summary: string; image_local_path: string }[] {
+  if (!db || keywords.length === 0) return []
+  const conditions = keywords.map(() => 'ai_summary LIKE ?').join(' OR ')
+  const params = keywords.map(kw => `%${kw}%`)
+  return db
+    .prepare(`SELECT id, timestamp, ai_summary, image_local_path FROM contexts WHERE (${conditions}) AND image_local_path IS NOT NULL ORDER BY timestamp DESC LIMIT ?`)
+    .all(...params, limit) as { id: number; timestamp: number; ai_summary: string; image_local_path: string }[]
+}
+
+/**
+ * 搜索 slot_summaries 表中 summary 包含指定关键词的记录
+ * slot_summaries 是 15 分钟的活动总结，比单张截图的 ai_summary 信息更丰富
+ * 返回匹配的时间段起始时间戳，用于定位对应的截图
+ */
+export function searchSlotSummariesByKeywords(keywords: string[], limit: number = 10): { slot_start_ms: number; summary: string }[] {
+  if (!db || keywords.length === 0) return []
+  const conditions = keywords.map(() => 'summary LIKE ?').join(' OR ')
+  const params = keywords.map(kw => `%${kw}%`)
+  return db
+    .prepare(`SELECT slot_start_ms, summary FROM slot_summaries WHERE (${conditions}) ORDER BY slot_start_ms DESC LIMIT ?`)
+    .all(...params, limit) as { slot_start_ms: number; summary: string }[]
+}
+
+/**
+ * 获取指定时间段内 ai_summary 包含关键词的截图记录
+ * 用于从 slot_summaries 定位到的时间段中找到具体的 OKR 截图
+ */
+export function getContextsInRangeByKeywords(startMs: number, endMs: number, keywords: string[], limit: number = 5): { id: number; timestamp: number; ai_summary: string; image_local_path: string }[] {
+  if (!db || keywords.length === 0) return []
+  const conditions = keywords.map(() => 'ai_summary LIKE ?').join(' OR ')
+  const params = keywords.map(kw => `%${kw}%`)
+  return db
+    .prepare(`SELECT id, timestamp, ai_summary, image_local_path FROM contexts WHERE timestamp >= ? AND timestamp < ? AND (${conditions}) AND image_local_path IS NOT NULL ORDER BY timestamp ASC LIMIT ?`)
+    .all(startMs, endMs, ...params, limit) as { id: number; timestamp: number; ai_summary: string; image_local_path: string }[]
 }
 
 // Token 相关
@@ -761,6 +846,18 @@ export function getSlotSummariesForDate(date: string): { slot_start_ms: number; 
   return db
     .prepare('SELECT slot_start_ms, summary, updated_at FROM slot_summaries WHERE date = ? ORDER BY slot_start_ms DESC')
     .all(date) as { slot_start_ms: number; summary: string; updated_at: number }[]
+}
+
+export function getDistinctContextDates(): string[] {
+  if (!db) return []
+  const rows = db
+    .prepare(`
+      SELECT DISTINCT date(timestamp / 1000, 'unixepoch', 'localtime') as date
+      FROM contexts
+      ORDER BY date DESC
+    `)
+    .all() as { date: string }[]
+  return rows.map((row) => row.date)
 }
 
 /**
@@ -827,4 +924,125 @@ export function getSlotSummariesInRange(startMs: number, endMs: number): { slot_
   return db
     .prepare('SELECT slot_start_ms, summary FROM slot_summaries WHERE slot_start_ms >= ? AND slot_start_ms < ? ORDER BY slot_start_ms ASC')
     .all(startMs, endMs) as { slot_start_ms: number; summary: string }[]
+}
+
+/**
+ * 获取指定时间范围内的 contexts（截图识别记录）
+ * 用于报告生成时补充详细的截图描述
+ */
+export function getContextsInRange(startMs: number, endMs: number): { id: number; timestamp: number; ai_summary: string; intent_tags: string }[] {
+  if (!db) return []
+  return db
+    .prepare('SELECT id, timestamp, ai_summary, intent_tags FROM contexts WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp ASC')
+    .all(startMs, endMs) as { id: number; timestamp: number; ai_summary: string; intent_tags: string }[]
+}
+
+/**
+ * 获取指定日期范围内的 backlog 任务（含已完成和未完成）
+ * 用于报告生成时展示任务状态
+ */
+export function getBacklogInDateRange(startDate: string, endDate: string): unknown[] {
+  if (!db) return []
+  return db
+    .prepare(`SELECT * FROM backlog WHERE is_hidden = 0 AND is_abandoned = 0 AND (task_date >= ? AND task_date <= ?) ORDER BY created_at DESC`)
+    .all(startDate, endDate)
+}
+
+const CONTEXT_RETENTION_DAYS = 7
+const SUMMARY_RETENTION_DAYS = 7
+const TOKEN_USAGE_RETENTION_DAYS = 14
+const SLOT_SUMMARY_RETENTION_DAYS = 7
+
+/**
+ * Auto-cleanup: remove data older than retention period to prevent database bloat.
+ * Aggressive retention policy to prevent the 14 GB bloat seen in production:
+ * - contexts: 7 days (generates ~3600 rows/day at 5s intervals)
+ * - summaries: 7 days (6 tiers × hundreds of rows/day)
+ * - token_usage: 14 days
+ * - slot_summaries: 7 days
+ * After cleanup, runs VACUUM to reclaim disk space.
+ */
+function cleanupOldData(): void {
+  if (!db) return
+
+  try {
+    const contextsCutoff = Date.now() - CONTEXT_RETENTION_DAYS * 24 * 60 * 60 * 1000
+    const summariesCutoff = Date.now() - SUMMARY_RETENTION_DAYS * 24 * 60 * 60 * 1000
+    const tokenCutoff = Date.now() - TOKEN_USAGE_RETENTION_DAYS * 24 * 60 * 60 * 1000
+    const slotCutoffDate = new Date(Date.now() - SLOT_SUMMARY_RETENTION_DAYS * 24 * 60 * 60 * 1000)
+      .toISOString()
+      .split('T')[0]
+
+    const contextsDel = db.prepare('DELETE FROM contexts WHERE timestamp < ?').run(contextsCutoff)
+    const summariesDel = db.prepare('DELETE FROM summaries WHERE timestamp < ?').run(summariesCutoff)
+    const tokenDel = db.prepare('DELETE FROM token_usage WHERE timestamp < ?').run(tokenCutoff)
+    const slotDel = db.prepare('DELETE FROM slot_summaries WHERE date < ?').run(slotCutoffDate)
+
+    const totalDeleted = contextsDel.changes + summariesDel.changes + tokenDel.changes + slotDel.changes
+    if (totalDeleted > 0) {
+      console.log(`[DB] Auto-cleanup: removed ${contextsDel.changes} contexts, ${summariesDel.changes} summaries, ${tokenDel.changes} token_usage, ${slotDel.changes} slot_summaries`)
+      // Reclaim disk space after large deletions
+      db.exec('VACUUM')
+      console.log('[DB] VACUUM completed — disk space reclaimed')
+    }
+
+    // Log database file size for monitoring
+    logDatabaseSize()
+  } catch (error) {
+    console.error('[DB] Auto-cleanup failed:', error)
+  }
+}
+
+/**
+ * Log the current database file size for monitoring.
+ * Warns if the database exceeds 500 MB.
+ */
+function logDatabaseSize(): void {
+  try {
+    const dbPath = db.pragma('database_list') as { file: string }[]
+    if (dbPath.length > 0 && dbPath[0].file) {
+      const stats = fs.statSync(dbPath[0].file)
+      const sizeMB = (stats.size / (1024 * 1024)).toFixed(1)
+      console.log(`[DB] Database size: ${sizeMB} MB`)
+      if (stats.size > 500 * 1024 * 1024) {
+        console.warn(`[DB] ⚠️ Database size exceeds 500 MB (${sizeMB} MB). Consider reducing retention periods.`)
+      }
+    }
+  } catch (error) {
+    console.error('[DB] Failed to check database size:', error)
+  }
+}
+
+// Daily Reports 相关（持久化日报）
+
+export interface DailyReportRow {
+  date: string
+  insight_text: string
+  warning_text: string | null
+  generated_at: number
+}
+
+export function saveDailyReport(date: string, insightText: string, warningText?: string): void {
+  if (!db) return
+  db.prepare(`
+    INSERT OR REPLACE INTO daily_reports (date, insight_text, warning_text, generated_at)
+    VALUES (?, ?, ?, ?)
+  `).run(date, insightText, warningText ?? null, Date.now())
+  console.log(`[DB] Daily report saved for ${date}`)
+}
+
+export function getDailyReport(date: string): DailyReportRow | null {
+  if (!db) return null
+  const row = db
+    .prepare('SELECT date, insight_text, warning_text, generated_at FROM daily_reports WHERE date = ?')
+    .get(date) as DailyReportRow | undefined
+  return row ?? null
+}
+
+export function getDailyReportDates(): string[] {
+  if (!db) return []
+  const rows = db
+    .prepare('SELECT date FROM daily_reports ORDER BY date DESC')
+    .all() as { date: string }[]
+  return rows.map((row) => row.date)
 }

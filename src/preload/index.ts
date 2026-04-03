@@ -6,6 +6,7 @@ const api = {
   saveSettings: (key: string, value: string) => ipcRenderer.invoke('save-settings', key, value),
   getSettings: (key: string) => ipcRenderer.invoke('get-settings', key),
   getContexts: (date: string) => ipcRenderer.invoke('get-contexts', date),
+  getContextDetail: (contextId: number) => ipcRenderer.invoke('get-context-detail', contextId),
   getBacklog: () => ipcRenderer.invoke('get-backlog'),
   updateBacklogStatus: (id: string, completed: boolean) =>
     ipcRenderer.invoke('update-backlog-status', id, completed),
@@ -38,6 +39,27 @@ const api = {
   getModelPricing: (modelName: string) =>
     ipcRenderer.invoke('get-model-pricing', modelName),
 
+  // Report Generation APIs
+  generateReport: (params: {
+    reportType: 'daily' | 'weekly' | 'monthly'
+    version: 'personal' | 'professional'
+    startMs: number
+    endMs: number
+    userNotes: string
+    language: 'zh' | 'en'
+  }) => ipcRenderer.invoke('generate-report', params),
+  refineReport: (params: {
+    originalData: string
+    previousReport: string
+    userFeedback: string
+    language: 'zh' | 'en'
+    version: 'personal' | 'professional'
+  }) => ipcRenderer.invoke('refine-report', params),
+  translateReport: (params: {
+    report: string
+    targetLanguage: 'zh' | 'en'
+  }) => ipcRenderer.invoke('translate-report', params),
+
   // OpenClaw APIs
   openclawInstall: () => ipcRenderer.invoke('openclaw-install'),
   openclawSetupChannel: (channel: 'weixin' | 'feishu') => ipcRenderer.invoke('openclaw-setup-channel', channel),
@@ -47,6 +69,16 @@ const api = {
   openclawSyncApiKey: () => ipcRenderer.invoke('openclaw-sync-apikey'),
   openclawSkipIm: () => ipcRenderer.invoke('openclaw-skip-im'),
   openclawGetDashboardUrl: () => ipcRenderer.invoke('openclaw-get-dashboard-url'),
+
+  // Daily report APIs
+  getDailyReportDates: () => ipcRenderer.invoke('get-daily-report-dates'),
+  getDailyReport: (date: string) => ipcRenderer.invoke('get-daily-report', date),
+
+  // OKR text parsing (user manually inputs text → AI parses into structured OKR)
+  parseOkrText: (inputText: string) => ipcRenderer.invoke('parse-okr-text', inputText),
+
+  // Backlog bootstrap (cold start)
+  bootstrapBacklog: () => ipcRenderer.invoke('bootstrap-backlog'),
 
   // OpenClaw event listeners
   onOpenclawInstallProgress: (callback: (data: { step: string; message: string }) => void) => {

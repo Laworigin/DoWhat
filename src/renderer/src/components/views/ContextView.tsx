@@ -15,9 +15,42 @@ interface BacklogItem {
   origin_id?: string | null
   description?: string
   subtasks?: { title: string; completed: boolean }[]
+  /** 完成方式：'manual' 手动勾选 | 'ai' AI自动识别 | null 未完成 */
+  completed_by?: string | null
 }
 
 
+
+// ─── CompletedActivityItem：AI 识别的已完成活动卡片（支持展开描述）─────────────
+const CompletedActivityItem: React.FC<{ activity: { title: string; description: string; time: string } }> = ({ activity }) => {
+  const [isExpanded, setIsExpanded] = useState(false)
+
+  return (
+    <div
+      className="px-3 py-2.5 rounded-lg bg-white/[0.03] border border-white/5 group cursor-pointer"
+      onClick={() => activity.description && setIsExpanded(!isExpanded)}
+    >
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="text-green-500 text-[10px]">✓</span>
+          <span className="text-[12px] text-gray-400 font-medium truncate">{activity.title}</span>
+          <span className="inline-flex items-center text-[8px] font-black px-1.5 py-0.5 rounded-md bg-indigo-500/15 text-indigo-400">AI 识别</span>
+        </div>
+        <span className="text-[10px] text-gray-600 font-mono shrink-0 ml-2">{activity.time}</span>
+      </div>
+      {activity.description && (
+        <p className={`text-[10px] text-gray-500 mt-1 ml-5 ${isExpanded ? '' : 'line-clamp-1'}`}>
+          {activity.description}
+        </p>
+      )}
+      {activity.description && (
+        <span className="text-[8px] text-gray-600 ml-5 group-hover:text-gray-400 transition-colors">
+          {isExpanded ? '收起' : '展开详情'}
+        </span>
+      )}
+    </div>
+  )
+}
 
 // ─── PipelineItem：单条任务卡片 ──────────────────────────────────────────────
 interface PipelineItemProps {
@@ -29,6 +62,7 @@ interface PipelineItemProps {
 }
 
 const PipelineItem: React.FC<PipelineItemProps> = ({ item, onToggle, onEdit, variant = 'today', isPromoted }) => {
+  const [isDescriptionExpanded, setIsDescriptionExpanded] = useState(false)
   const variantStyles = {
     focus: 'bg-red-500/8 border-red-500/25 hover:border-red-500/50',
     today: 'bg-indigo-500/5 border-indigo-500/20 hover:border-indigo-500/40 hover:bg-indigo-500/8',
@@ -53,7 +87,7 @@ const PipelineItem: React.FC<PipelineItemProps> = ({ item, onToggle, onEdit, var
       `}
     >
       {/* 优先级角标 */}
-      {item.priority && !item.completed && (
+      {!!item.priority && !item.completed && (
         <div className={`absolute top-0 right-0 px-1.5 py-0.5 text-[7px] font-black uppercase tracking-tighter rounded-bl-lg ${
           item.priority === 1 ? 'bg-red-500/80 text-white' :
           item.priority === 2 ? 'bg-orange-500/80 text-white' : 'bg-blue-500/80 text-white'
@@ -63,8 +97,13 @@ const PipelineItem: React.FC<PipelineItemProps> = ({ item, onToggle, onEdit, var
       )}
 
       <div className="flex items-start justify-between gap-3 mb-1">
-        <p className={`text-[12px] leading-snug flex-1 ${item.completed ? 'text-gray-500 line-through' : 'text-white'}`}>
+        <p className={`text-[12px] leading-snug flex-1 ${item.completed ? 'text-gray-500' : 'text-white'}`}>
           {item.title}
+          {!!item.completed && (
+            <span className={`ml-2 inline-flex items-center text-[8px] font-black px-1.5 py-0.5 rounded-md ${item.completed_by === 'ai' ? 'bg-indigo-500/15 text-indigo-400' : 'bg-green-500/15 text-green-400'}`}>
+              {item.completed_by === 'ai' ? 'AI 识别' : '手动'}
+            </span>
+          )}
         </p>
         <div className="flex items-center gap-1.5 shrink-0">
           {!item.completed && onEdit && (
@@ -90,6 +129,19 @@ const PipelineItem: React.FC<PipelineItemProps> = ({ item, onToggle, onEdit, var
         <p className="text-[10px] leading-relaxed text-gray-400 mb-1.5 line-clamp-2">
           {item.description}
         </p>
+      )}
+      {item.description && !!item.completed && (
+        <button
+          onClick={() => setIsDescriptionExpanded(!isDescriptionExpanded)}
+          className="w-full text-left mt-1 group/desc"
+        >
+          <p className={`text-[10px] leading-relaxed text-gray-500 ${isDescriptionExpanded ? '' : 'line-clamp-1'}`}>
+            {item.description}
+          </p>
+          <span className="text-[8px] text-gray-600 group-hover/desc:text-gray-400 transition-colors">
+            {isDescriptionExpanded ? '收起' : '展开详情'}
+          </span>
+        </button>
       )}
 
       {/* AI 推荐徽章 */}
@@ -426,18 +478,7 @@ const PipelinePanel: React.FC<PipelinePanelProps> = ({ backlog, slotSummaries, o
                 ))}
                 {/* AI 识别的已完成活动 */}
                 {completedActivities.map((activity, index) => (
-                  <div key={`activity-${index}`} className="px-3 py-2.5 rounded-lg bg-white/[0.03] border border-white/5 group">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <span className="text-green-500 text-[10px]">✓</span>
-                        <span className="text-[12px] text-gray-400 font-medium truncate">{activity.title}</span>
-                      </div>
-                      <span className="text-[10px] text-gray-600 font-mono shrink-0 ml-2">{activity.time}</span>
-                    </div>
-                    {activity.description && (
-                      <p className="text-[10px] text-gray-600 mt-1 ml-5 line-clamp-1">{activity.description}</p>
-                    )}
-                  </div>
+                  <CompletedActivityItem key={`activity-${index}`} activity={activity} />
                 ))}
                 {totalCompleted === 0 && (
                   <div className="py-6 text-center border border-dashed border-white/5 rounded-xl">
@@ -601,37 +642,59 @@ const TaskTag: React.FC<TaskTagProps> = ({ label, type = 'gray' }) => {
 interface ContextCardProps {
   time: string
   summary: string
-  screenshotUrl: string
+  screenshotUrl?: string
   compact?: boolean
+  contextId?: number
 }
 
-const ContextCard: React.FC<ContextCardProps> = ({ time, summary, screenshotUrl, compact = false }) => {
-  // 使用 encodeURI 保留路径分隔符，同时处理空格等特殊字符
-  // 注意：需要处理 Windows 反斜杠的情况，统一转换为正斜杠
-  const normalizedPath = screenshotUrl.replace(/\\/g, '/')
-  const safeUrl = `local-file://${normalizedPath}`
-
+const ContextCard: React.FC<ContextCardProps> = ({ time, summary, screenshotUrl, compact = false, contextId }) => {
   const [lightboxOpen, setLightboxOpen] = useState(false)
+  const [loadedImageUrl, setLoadedImageUrl] = useState<string | null>(null)
+
+  // Lazy-load image: only fetch image_local_path when lightbox is opened
+  const handleOpenLightbox = async (): Promise<void> => {
+    if (loadedImageUrl) {
+      setLightboxOpen(true)
+      return
+    }
+    if (screenshotUrl) {
+      const normalizedPath = screenshotUrl.replace(/\\/g, '/')
+      setLoadedImageUrl(`local-file://${normalizedPath}`)
+      setLightboxOpen(true)
+    } else if (contextId) {
+      // @ts-ignore: window.api is injected via preload script
+      const detail = await window.api.getContextDetail(contextId)
+      if (detail?.image_local_path) {
+        const normalizedPath = detail.image_local_path.replace(/\\/g, '/')
+        setLoadedImageUrl(`local-file://${normalizedPath}`)
+      }
+      setLightboxOpen(true)
+    }
+  }
+
+  // For thumbnail: use a placeholder gradient instead of loading the actual image
+  const safeUrl = screenshotUrl ? `local-file://${screenshotUrl.replace(/\\/g, '/')}` : null
 
   if (compact) {
     return (
       <>
-        {/* Thumbnail */}
+        {/* Thumbnail — uses placeholder gradient when image not loaded */}
         <div
-          className="relative aspect-[16/10] bg-white/5 rounded-lg border border-white/5 overflow-visible group cursor-pointer hover:z-[60]"
+          className="relative aspect-[16/10] bg-gradient-to-br from-indigo-500/10 to-purple-500/10 rounded-lg border border-white/5 overflow-visible group cursor-pointer hover:z-[60]"
           title={`${time}`}
-          onClick={() => setLightboxOpen(true)}
+          onClick={handleOpenLightbox}
         >
-          {/* 实际图片层：hover 时 scale 放大，z-index 提高 */}
-          <div
-            className="absolute inset-0 rounded-lg overflow-hidden bg-cover bg-center grayscale-[0.3]
-                        group-hover:grayscale-0 group-hover:scale-[2.8] group-hover:z-[60]
-                        transition-all duration-200 ease-out origin-center shadow-none group-hover:shadow-2xl group-hover:ring-2 group-hover:ring-indigo-400/60"
-            style={{ backgroundImage: `url("${safeUrl}")` }}
-          />
+          {safeUrl && (
+            <div
+              className="absolute inset-0 rounded-lg overflow-hidden bg-cover bg-center grayscale-[0.3]
+                          group-hover:grayscale-0 group-hover:scale-[2.8] group-hover:z-[60]
+                          transition-all duration-200 ease-out origin-center shadow-none group-hover:shadow-2xl group-hover:ring-2 group-hover:ring-indigo-400/60"
+              style={{ backgroundImage: `url("${safeUrl}")` }}
+            />
+          )}
         </div>
 
-        {/* Lightbox */}
+        {/* Lightbox — lazy-loaded image */}
         {lightboxOpen && (
           <div
             className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/80 backdrop-blur-sm"
@@ -640,11 +703,17 @@ const ContextCard: React.FC<ContextCardProps> = ({ time, summary, screenshotUrl,
             <div
               className="relative max-w-[90vw] max-h-[90vh] rounded-2xl overflow-hidden shadow-2xl ring-1 ring-white/10"
             >
-              <img
-                src={safeUrl}
-                alt={summary}
-                className="block max-w-[90vw] max-h-[85vh] object-contain"
-              />
+              {loadedImageUrl ? (
+                <img
+                  src={loadedImageUrl}
+                  alt={summary}
+                  className="block max-w-[90vw] max-h-[85vh] object-contain"
+                />
+              ) : (
+                <div className="flex items-center justify-center w-[400px] h-[300px] bg-gray-900 text-gray-500 text-sm">
+                  Loading...
+                </div>
+              )}
               {/* Caption */}
               <div className="absolute bottom-0 left-0 right-0 px-4 py-3 bg-gradient-to-t from-black/80 to-transparent">
                 <p className="text-xs text-white/90 font-medium leading-snug">{summary}</p>
@@ -665,10 +734,10 @@ const ContextCard: React.FC<ContextCardProps> = ({ time, summary, screenshotUrl,
   }
 
   return (
-    <div className="bg-white/5 rounded-xl border border-white/5 overflow-hidden group transition-all duration-300 hover:border-white/10 hover:bg-white/8 shadow-sm">
+    <div className="bg-white/5 rounded-xl border border-white/5 overflow-hidden group transition-all duration-300 hover:border-white/10 hover:bg-white/8 shadow-sm cursor-pointer" onClick={handleOpenLightbox}>
       <div
-        className="aspect-[16/10] bg-cover bg-center grayscale-[0.2] group-hover:grayscale-0 transition-all duration-500"
-        style={{ backgroundImage: `url("${safeUrl}")` }}
+        className="aspect-[16/10] bg-gradient-to-br from-indigo-500/10 to-purple-500/10 bg-cover bg-center grayscale-[0.2] group-hover:grayscale-0 transition-all duration-500"
+        style={safeUrl ? { backgroundImage: `url("${safeUrl}")` } : undefined}
       ></div>
       <div className="p-2.5">
         <p className="text-[11px] font-bold text-white/80 mb-0.5 truncate tracking-tight">
@@ -688,7 +757,7 @@ const ContextCard: React.FC<ContextCardProps> = ({ time, summary, screenshotUrl,
 interface ContextItem {
   id?: number
   timestamp: number
-  image_local_path: string
+  image_local_path?: string
   ai_summary: string
   intent_tags: string[]
   is_productive?: boolean
@@ -842,6 +911,7 @@ function ContextGroupCard({ group, isExpanded, onToggle }: ContextGroupCardProps
               time={formatTime(item.timestamp)}
               summary={item.ai_summary}
               screenshotUrl={item.image_local_path}
+              contextId={item.id}
               compact={true}
             />
           ))}

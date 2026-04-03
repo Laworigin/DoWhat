@@ -12,6 +12,7 @@ import {
   Sparkles,
   AlertCircle
 } from 'lucide-react'
+import { ReportExportModal } from '../ReportExportModal'
 
 import { LucideProps } from 'lucide-react'
 
@@ -107,12 +108,13 @@ export const StatsView: React.FC = () => {
   )
   const [loadingInsight, setLoadingInsight] = useState(false)
   const [hoveredPoint, setHoveredPoint] = useState<{ index: number; x: number; y: number; val: number; label: string } | null>(null)
+  const [showReportModal, setShowReportModal] = useState(false)
 
   useEffect(() => {
     const loadStats = async (): Promise<void> => {
       const now = Date.now()
-      const oneDay = 24 * 60 * 60 * 1000
       let start: number
+      let end: number = now
 
       if (activeCycle === 'day') {
         // 今日日报：从当天 00:00:00 开始
@@ -120,18 +122,36 @@ export const StatsView: React.FC = () => {
         today.setHours(0, 0, 0, 0)
         start = today.getTime()
       } else if (activeCycle === 'week') {
-        start = now - 7 * oneDay
+        // 本周复盘：从本周一 00:00:00 到本周日 23:59:59（固定 7 天时间轴）
+        const monday = new Date()
+        const dayOfWeek = monday.getDay()
+        const diffToMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1
+        monday.setDate(monday.getDate() - diffToMonday)
+        monday.setHours(0, 0, 0, 0)
+        start = monday.getTime()
+        // end 设为本周日 23:59:59，确保后端生成完整 7 天数据
+        const sunday = new Date(monday)
+        sunday.setDate(sunday.getDate() + 6)
+        sunday.setHours(23, 59, 59, 999)
+        end = sunday.getTime()
       } else {
-        start = now - 30 * oneDay
+        // 月度度量：从本月1号 00:00:00 到月末 23:59:59（固定完整月时间轴）
+        const firstDay = new Date()
+        firstDay.setDate(1)
+        firstDay.setHours(0, 0, 0, 0)
+        start = firstDay.getTime()
+        const lastDay = new Date(firstDay.getFullYear(), firstDay.getMonth() + 1, 0)
+        lastDay.setHours(23, 59, 59, 999)
+        end = lastDay.getTime()
       }
 
-      const data = (await window.api.getStatsSummary(start, now)) as StatsData
+      const data = (await window.api.getStatsSummary(start, end)) as StatsData
       setStats(data)
 
       // 优先从缓存加载 AI 洞察（传入 cycle 参数）
       setLoadingInsight(true)
       try {
-        const insightData = await window.api.getStatsInsight(start, now, activeCycle)
+        const insightData = await window.api.getStatsInsight(start, end, activeCycle)
         setInsight(insightData)
       } catch (err) {
         console.error('Failed to load insight:', err)
@@ -175,11 +195,18 @@ export const StatsView: React.FC = () => {
       return now.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' })
     }
     if (activeCycle === 'week') {
-      const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)
+      const monday = new Date(now)
+      const dow = monday.getDay()
+      monday.setDate(monday.getDate() - (dow === 0 ? 6 : dow - 1))
+      const sunday = new Date(monday)
+      sunday.setDate(monday.getDate() + 6)
       const fmt = (d: Date): string => `${d.getMonth() + 1}月${d.getDate()}日`
-      return `${fmt(weekAgo)} - ${fmt(now)}, ${now.getFullYear()}`
+      return `${fmt(monday)} - ${fmt(sunday)}, ${now.getFullYear()}`
     }
-    return now.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long' })
+    const firstDay = new Date(now.getFullYear(), now.getMonth(), 1)
+    const lastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0)
+    const fmt = (d: Date): string => `${d.getMonth() + 1}月${d.getDate()}日`
+    return `${fmt(firstDay)} - ${fmt(lastDay)}, ${now.getFullYear()}`
   }
 
   const workTrend = getWorkTrend()
@@ -249,7 +276,10 @@ export const StatsView: React.FC = () => {
                 {getDateRangeText()}
               </p>
             </div>
-            <button className="flex items-center gap-2 bg-white/10 hover:bg-white/15 text-white/90 text-[13px] font-bold px-4 py-2.5 rounded-xl border border-white/5 transition-all active:scale-95 shadow-lg">
+            <button
+              onClick={() => setShowReportModal(true)}
+              className="flex items-center gap-2 bg-white/10 hover:bg-white/15 text-white/90 text-[13px] font-bold px-4 py-2.5 rounded-xl border border-white/5 transition-all active:scale-95 shadow-lg"
+            >
               <Download className="w-4 h-4" />
               {exportLabel}
             </button>
@@ -286,7 +316,14 @@ export const StatsView: React.FC = () => {
               value={
                 hasData
                   ? stats?.top_intents?.[0]
-                    ? JSON.parse(stats.top_intents[0].intent_tags)[0]
+                    ? (() => {
+                        const raw = stats.top_intents[0].intent_tags
+                        try {
+                          const parsed = JSON.parse(raw)
+                          if (Array.isArray(parsed)) return parsed[0] || '暂无'
+                        } catch { /* 非 JSON */ }
+                        return raw || '暂无'
+                      })()
                     : '暂无'
                   : '暂无数据'
               }
@@ -391,11 +428,23 @@ export const StatsView: React.FC = () => {
                             if (activeCycle === 'day') {
                               tooltipLabel = `${String(originalIndex).padStart(2, '0')}:00`
                             } else {
-                              const now = Date.now()
                               const oneDay = 24 * 60 * 60 * 1000
-                              const periodStart = activeCycle === 'week' ? now - 7 * oneDay : now - 30 * oneDay
+                              const dayNames = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+                              let periodStart: number
+                              if (activeCycle === 'week') {
+                                const monday = new Date()
+                                const dow = monday.getDay()
+                                monday.setDate(monday.getDate() - (dow === 0 ? 6 : dow - 1))
+                                monday.setHours(0, 0, 0, 0)
+                                periodStart = monday.getTime()
+                              } else {
+                                const firstDay = new Date()
+                                firstDay.setDate(1)
+                                firstDay.setHours(0, 0, 0, 0)
+                                periodStart = firstDay.getTime()
+                              }
                               const pointDate = new Date(periodStart + originalIndex * oneDay)
-                              tooltipLabel = `${pointDate.getMonth() + 1}月${pointDate.getDate()}日`
+                              tooltipLabel = `${pointDate.getMonth() + 1}月${pointDate.getDate()}日 ${dayNames[pointDate.getDay()]}`
                             }
                             return (
                               <g key={i}>
@@ -451,18 +500,42 @@ export const StatsView: React.FC = () => {
                               </text>
                             )
                           })}
-                          {activeCycle === 'week' && ['周一', '周二', '周三', '周四', '周五', '周末'].map((label, i) => {
-                            const x = chartLeft + (i / 5) * chartWidth
-                            return (
-                              <text key={label} x={x} y={chartBottom + 14} textAnchor="middle" fill="rgba(255,255,255,0.3)" fontSize="8">{label}</text>
-                            )
-                          })}
-                          {activeCycle === 'month' && ['第一周', '第二周', '第三周', '第四周'].map((label, i) => {
-                            const x = chartLeft + (i / 3) * chartWidth
-                            return (
-                              <text key={label} x={x} y={chartBottom + 14} textAnchor="middle" fill="rgba(255,255,255,0.3)" fontSize="8">{label}</text>
-                            )
-                          })}
+                          {activeCycle === 'week' && (() => {
+                            const dayNames = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+                            const monday = new Date()
+                            const dow = monday.getDay()
+                            monday.setDate(monday.getDate() - (dow === 0 ? 6 : dow - 1))
+                            monday.setHours(0, 0, 0, 0)
+                            return Array.from({ length: 7 }, (_, i) => {
+                              const pointDate = new Date(monday.getTime() + i * 24 * 60 * 60 * 1000)
+                              const label = `${pointDate.getMonth() + 1}/${pointDate.getDate()} ${dayNames[pointDate.getDay()]}`
+                              const x = chartLeft + (i / 6) * chartWidth
+                              return (
+                                <text key={i} x={x} y={chartBottom + 14} textAnchor="middle" fill="rgba(255,255,255,0.3)" fontSize="7">{label}</text>
+                              )
+                            })
+                          })()}
+                          {activeCycle === 'month' && (() => {
+                            const firstDay = new Date()
+                            firstDay.setDate(1)
+                            firstDay.setHours(0, 0, 0, 0)
+                            const lastDay = new Date(firstDay.getFullYear(), firstDay.getMonth() + 1, 0)
+                            const totalDays = lastDay.getDate()
+                            const step = Math.max(1, Math.floor(totalDays / 6))
+                            const labels: { index: number; label: string }[] = []
+                            for (let i = 0; i < totalDays; i += step) {
+                              labels.push({ index: i, label: `${firstDay.getMonth() + 1}/${i + 1}` })
+                            }
+                            if (labels[labels.length - 1].index !== totalDays - 1) {
+                              labels.push({ index: totalDays - 1, label: `${firstDay.getMonth() + 1}/${totalDays}` })
+                            }
+                            return labels.map(({ index, label }) => {
+                              const x = chartLeft + (totalDays > 1 ? (index / (totalDays - 1)) * chartWidth : 0)
+                              return (
+                                <text key={index} x={x} y={chartBottom + 14} textAnchor="middle" fill="rgba(255,255,255,0.3)" fontSize="7">{label}</text>
+                              )
+                            })
+                          })()}
                         </>
                       )
                     })()}
@@ -498,12 +571,32 @@ export const StatsView: React.FC = () => {
               <div className="space-y-6">
                 {hasData && stats?.top_intents?.length > 0 ? (
                   (() => {
-                    const intentTotalCount = stats.top_intents.reduce((sum: number, item: { count: number }) => sum + item.count, 0)
-                    return stats.top_intents.map((intent: { intent_tags: string; count: number }, i: number) => (
+                    // 从 intent_tags 中提取可读标签（兼容纯字符串和 JSON 数组格式）
+                    const extractLabel = (raw: string): string => {
+                      if (!raw) return '未知'
+                      try {
+                        const parsed = JSON.parse(raw)
+                        if (Array.isArray(parsed)) return parsed[0] || '未知'
+                      } catch { /* 非 JSON，直接使用原始字符串 */ }
+                      return raw
+                    }
+
+                    // 按提取后的标签合并同名项（防御旧缓存数据未聚合的情况）
+                    const mergedMap = new Map<string, number>()
+                    for (const item of stats.top_intents) {
+                      const label = extractLabel(item.intent_tags)
+                      mergedMap.set(label, (mergedMap.get(label) || 0) + item.count)
+                    }
+                    const mergedIntents = [...mergedMap.entries()]
+                      .sort((a, b) => b[1] - a[1])
+                      .slice(0, 5)
+
+                    const intentTotalCount = mergedIntents.reduce((sum, [, count]) => sum + count, 0)
+                    return mergedIntents.map(([label, count], i) => (
                       <IntentBar
                         key={i}
-                        label={JSON.parse(intent.intent_tags)[0]}
-                        percentage={Math.round((intent.count / Math.max(intentTotalCount, 1)) * 100)}
+                        label={label}
+                        percentage={Math.round((count / Math.max(intentTotalCount, 1)) * 100)}
                         color={
                           [
                             'bg-indigo-500',
@@ -580,6 +673,25 @@ export const StatsView: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {/* Report Export Modal */}
+      <ReportExportModal
+        visible={showReportModal}
+        onClose={() => setShowReportModal(false)}
+        reportType={activeCycle === 'day' ? 'daily' : activeCycle === 'week' ? 'weekly' : 'monthly'}
+        startMs={(() => {
+          const now = Date.now()
+          const oneDay = 24 * 60 * 60 * 1000
+          if (activeCycle === 'day') {
+            const today = new Date()
+            today.setHours(0, 0, 0, 0)
+            return today.getTime()
+          }
+          if (activeCycle === 'week') return now - 7 * oneDay
+          return now - 30 * oneDay
+        })()}
+        endMs={Date.now()}
+      />
     </div>
   )
 }

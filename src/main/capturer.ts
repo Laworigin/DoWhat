@@ -5,7 +5,8 @@ import sharp from 'sharp'
 import OpenAI from 'openai'
 import * as db from './database'
 import { runStorageMaintenance } from './maintenance'
-import { TASK_DISCOVERY_PROMPT, TASK_COMPLETION_PROMPT, TASK_PRIORITY_PROMPT } from './prompts/pipeline_optimization'
+import { TASK_DISCOVERY_PROMPT, TASK_COMPLETION_PROMPT, TASK_PRIORITY_PROMPT, TASK_CLASSIFICATION_PROMPT } from './prompts/pipeline_optimization'
+import { REPORT_PERSONAL_GENERATE_PROMPT } from './prompts/report_personal'
 
 /**
  * 从本地文件加载提示词
@@ -134,10 +135,9 @@ async function captureScreen(): Promise<void> {
       const fileName = `${timestamp}.jpg`
       const absolutePath = path.join(minutePath, fileName)
 
-      // 2. 提升截图清晰度 (为了 AI 识别，确保质量)
+      // 2. 保存截图 (保持原始分辨率和质量，确保 AI 识别准确度)
       await sharp(buffer)
-        .resize(1920, 1080, { fit: 'inside', withoutEnlargement: true })
-        .jpeg({ quality: 90, progressive: true })
+        .jpeg({ quality: 90 })
         .toFile(absolutePath)
 
       console.log(`[Capture] 截图保存成功: ${absolutePath}`)
@@ -206,13 +206,11 @@ async function analyzeAndSaveContext(imagePath: string, timestamp: number): Prom
             },
             {
               type: 'text',
-              text: '请根据提供的截图，识别当前应用、操作内容，并严格按如下 JSON schema 返回结果：\n{"intent": string, "tags": string[], "is_productive": boolean, "category": "编程|会议|沟通|设计|文档|调研|闲暇|其他", "secondary_activity": string}'
+              text: '请根据提供的截图，识别当前应用、操作内容并返回 JSON 格式结果。'
             }
           ]
         }
       ],
-      max_tokens: 1000,
-      temperature: 0.1,
       response_format: { type: 'json_object' }
     })
 
@@ -235,6 +233,7 @@ async function analyzeAndSaveContext(imagePath: string, timestamp: number): Prom
       is_productive: boolean
       category: string
       secondary_activity?: string
+      contains_okr?: boolean
     }
     try {
       aiData = JSON.parse(cleanContent)
@@ -248,6 +247,8 @@ async function analyzeAndSaveContext(imagePath: string, timestamp: number): Prom
         category: '其他'
       }
     }
+
+    // OKR 实时检测已移除：改为用户手动录入文字后 AI 解析
 
     // 4.1 数据入库与推送（任务识别由 AI 在15分钟槽归纳时统一处理，不在此处自动创建流水账任务）
     const tagsWithCategory = [
@@ -286,6 +287,311 @@ async function analyzeAndSaveContext(imagePath: string, timestamp: number): Prom
     processTieredSummaries()
   } catch (error) {
     console.error('[LLM] AI 视觉分析失败:', error)
+  }
+}
+
+interface OkrKeyResult {
+  name: string
+  baseline: string
+  stretch?: string
+  longTerm?: string
+}
+
+interface OkrObjective {
+  title: string
+  key_results: (string | OkrKeyResult)[]
+}
+
+/**
+ * 从指定截图中提取 OKR objectives（不存储，只返回提取结果）
+ * 用于多截图合并提取场景
+ */
+async function extractOkrObjectivesFromImage(
+  imagePath: string,
+  openai: OpenAI,
+  modelName: string
+): Promise<{ objectives: OkrObjective[]; sourceDescription: string } | null> {
+  try {
+    if (!fs.existsSync(imagePath)) {
+      console.log(`[OKR] 截图文件不存在，跳过: ${imagePath}`)
+      return null
+    }
+
+    const base64Image = fs.readFileSync(imagePath).toString('base64')
+    const okrPrompt = loadPrompt('okr_extraction')
+
+    const response = await openai.chat.completions.create({
+      model: modelName,
+      messages: [
+        { role: 'system', content: okrPrompt },
+        {
+          role: 'user',
+          content: [
+            { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64Image}` } },
+            { type: 'text', text: '请从截图中提取完整的 OKR 内容。' }
+          ]
+        }
+      ],
+      response_format: { type: 'json_object' }
+    })
+
+    const content = response.choices[0].message.content
+    if (!content) return null
+
+    const usage = response.usage?.total_tokens || 0
+    db.saveTokenUsage(usage, modelName, 'okr_extraction')
+
+    const cleanContent = content.replace(/```json/g, '').replace(/```/g, '').trim()
+    const okrData = JSON.parse(cleanContent) as {
+      has_okr: boolean
+      objectives: OkrObjective[]
+      source_description: string
+    }
+
+    if (!okrData.has_okr || okrData.objectives.length === 0) {
+      console.log('[OKR] 截图中未检测到有效的 OKR 内容')
+      return null
+    }
+
+    console.log(`[OKR] 从截图提取到 ${okrData.objectives.length} 个目标 (${usage} tokens)`)
+    return { objectives: okrData.objectives, sourceDescription: okrData.source_description }
+  } catch (error) {
+    console.error('[OKR] OKR 提取失败:', (error as Error).message)
+    return null
+  }
+}
+
+/**
+ * 将提取到的 OKR objectives 合并去重后持久化存储
+ * 去重逻辑：按 objective title 的前缀（如 "O1:"、"O2:"）去重，保留内容更丰富的版本
+ */
+function saveOkrToSettings(
+  allObjectives: OkrObjective[],
+  sourceDescription: string,
+  sourceImagePath: string
+): void {
+  // 按 title 前缀去重（如 "O1: xxx" 和 "O1: yyy" 视为同一个 Objective）
+  const objectiveMap = new Map<string, OkrObjective>()
+  for (const objective of allObjectives) {
+    // 提取前缀 "O1"、"O2" 等作为去重 key
+    const prefixMatch = objective.title.match(/^O\d+/i)
+    const deduplicationKey = prefixMatch ? prefixMatch[0].toUpperCase() : objective.title
+
+    const existing = objectiveMap.get(deduplicationKey)
+    if (!existing || objective.key_results.length > existing.key_results.length) {
+      objectiveMap.set(deduplicationKey, objective)
+    }
+  }
+
+  const mergedObjectives = Array.from(objectiveMap.values())
+    .sort((objectiveA, objectiveB) => {
+      // 按 O1, O2, O3 排序
+      const numA = parseInt(objectiveA.title.match(/\d+/)?.[0] || '0')
+      const numB = parseInt(objectiveB.title.match(/\d+/)?.[0] || '0')
+      return numA - numB
+    })
+
+  const okrJson = JSON.stringify({
+    objectives: mergedObjectives,
+    source_description: sourceDescription
+  })
+  db.saveSetting('okr_current', okrJson)
+  db.saveSetting('okr_source_image', sourceImagePath)
+  db.saveSetting('okr_updated_at', new Date().toISOString())
+
+  console.log(`[OKR] ✅ OKR 已合并并持久化存储 (${mergedObjectives.length} 个目标)`)
+
+  // 通知前端 OKR 已更新
+  const mainWindow = BrowserWindow.getAllWindows()[0]
+  if (mainWindow) {
+    mainWindow.webContents.send('okr-updated', { objectives: mergedObjectives })
+  }
+}
+
+/**
+ * 从用户手动输入的文字中解析 OKR，调用 AI 提取结构化数据并存储。
+ * 替代原有的截图自动识别方案，由用户主动粘贴 OKR 文字触发。
+ */
+export async function parseOkrFromText(
+  inputText: string
+): Promise<{ success: boolean; objectiveCount: number; error?: string }> {
+  const apiKey = db.getSetting('api_key')
+  const endpoint = db.getSetting('endpoint')
+  const modelName = db.getSetting('model_name') || 'gpt-4o'
+
+  if (!apiKey || !endpoint) {
+    return { success: false, objectiveCount: 0, error: 'API 未配置' }
+  }
+
+  if (!inputText || inputText.trim().length < 10) {
+    return { success: false, objectiveCount: 0, error: '输入文字过短，请粘贴完整的 OKR 内容' }
+  }
+
+  const parsePrompt = loadPrompt('okr_parse_text')
+  if (!parsePrompt) {
+    return { success: false, objectiveCount: 0, error: 'prompt 加载失败' }
+  }
+
+  try {
+    const openai = new OpenAI({ apiKey, baseURL: endpoint.trim().replace(/\/+$/, '') })
+
+    const response = await openai.chat.completions.create({
+      model: modelName,
+      messages: [
+        { role: 'system', content: parsePrompt },
+        { role: 'user', content: inputText.trim() }
+      ],
+      response_format: { type: 'json_object' }
+    })
+
+    const content = response.choices[0].message.content
+    if (!content) {
+      return { success: false, objectiveCount: 0, error: 'AI 返回空内容' }
+    }
+
+    const usage = response.usage?.total_tokens || 0
+    db.saveTokenUsage(usage, modelName, 'okr_parse_text')
+
+    const okrData = JSON.parse(content) as {
+      has_okr: boolean
+      objectives: OkrObjective[]
+      source_description: string
+    }
+
+    if (!okrData.has_okr || !okrData.objectives || okrData.objectives.length === 0) {
+      return { success: false, objectiveCount: 0, error: '未能从文字中识别出有效的 OKR 内容' }
+    }
+
+    // 直接覆盖存储（用户手动录入的优先级最高）
+    const okrJson = JSON.stringify({
+      objectives: okrData.objectives,
+      source_description: okrData.source_description || '用户手动录入'
+    })
+    db.saveSetting('okr_current', okrJson)
+    db.saveSetting('okr_updated_at', new Date().toISOString())
+
+    console.log(`[OKR] ✅ 从用户输入文字中解析出 ${okrData.objectives.length} 个目标 (${usage} tokens)`)
+
+    // 通知前端 OKR 已更新
+    const mainWindow = BrowserWindow.getAllWindows()[0]
+    if (mainWindow) {
+      mainWindow.webContents.send('okr-updated', { objectives: okrData.objectives })
+    }
+
+    return { success: true, objectiveCount: okrData.objectives.length }
+  } catch (error) {
+    console.error('[OKR] 文字解析失败:', (error as Error).message)
+    return { success: false, objectiveCount: 0, error: (error as Error).message }
+  }
+}
+
+
+
+/**
+ * 用 LLM 从候选截图描述中筛选出"用户正在查看真正 OKR 文档"的截图
+ *
+ * 解决的核心问题：contexts 表中大量包含 OKR 关键词的记录其实是开发截图（编辑代码、查看 DoWhat UI 等），
+ * 硬编码排除规则太死板且无法适应新场景。用 LLM 做一轮轻量级筛选，只传 ai_summary 文本，成本极低。
+ */
+async function filterOkrCandidatesWithLLM(
+  candidates: { id: number; ai_summary: string }[],
+  openai: OpenAI,
+  modelName: string
+): Promise<number[]> {
+  const filterPrompt = loadPrompt('okr_filter')
+
+  // 构造候选列表文本
+  const candidateList = candidates
+    .map(ctx => `[id=${ctx.id}] ${ctx.ai_summary}`)
+    .join('\n')
+
+  const response = await openai.chat.completions.create({
+    model: modelName,
+    messages: [
+      { role: 'system', content: filterPrompt },
+      { role: 'user', content: candidateList }
+    ],
+    temperature: 0
+  })
+
+  const content = response.choices[0].message.content
+  if (!content) return []
+
+  const usage = response.usage?.total_tokens || 0
+  db.saveTokenUsage(usage, modelName, 'okr_filter')
+
+  const cleanContent = content.replace(/```json/g, '').replace(/```/g, '').trim()
+  const selectedIds = JSON.parse(cleanContent) as number[]
+  return Array.isArray(selectedIds) ? selectedIds : []
+}
+
+/**
+ * 主动扫描历史截图中的 OKR 内容（LLM 智能筛选方案）
+ *
+ * Step 1: 宽泛搜索 — 从 contexts 表取大量候选（LIMIT 200）
+ * Step 2: LLM 筛选 — 把所有候选的 ai_summary 喂给大模型，让它判断哪些是"用户正在查看真正的 OKR 文档"
+ * Step 3: 精准提取 — 只对 LLM 筛选出的截图调用 Vision API 提取完整 OKR
+ *
+ * 只在尚未存储 OKR 时执行，一旦提取成功就永久记忆。
+ */
+export async function scanAndExtractOkr(openai: OpenAI, modelName: string): Promise<void> {
+  // 检查是否已有 OKR（持久记忆）
+  const existingOkr = db.getSetting('okr_current')
+  if (existingOkr) {
+    console.log('[OKR] 已有持久化 OKR，跳过扫描')
+    return
+  }
+
+  console.log('[OKR] 未找到已存储的 OKR，开始智能扫描...')
+
+  // ─── Step 1: 宽泛搜索，取大量候选 ───
+  const okrKeywords = ['OKR', 'okr', '试用期OKR', '绩效目标', '季度目标', '年度OKR', '季度OKR']
+  const matchedContexts = db.searchContextsByKeywords(okrKeywords, 200)
+
+  if (matchedContexts.length === 0) {
+    console.log('[OKR] 历史截图中未找到 OKR 相关记录，等待后续截图')
+    return
+  }
+
+  console.log(`[OKR] Step1: 宽泛搜索找到 ${matchedContexts.length} 条候选`)
+
+  // ─── Step 2: LLM 智能筛选 ───
+  try {
+    const selectedIds = await filterOkrCandidatesWithLLM(matchedContexts, openai, modelName)
+
+    if (selectedIds.length === 0) {
+      console.log('[OKR] Step2: LLM 判断所有候选均非真正 OKR 文档，等待后续截图')
+      return
+    }
+
+    console.log(`[OKR] Step2: LLM 筛选出 ${selectedIds.length} 张真正的 OKR 截图: [${selectedIds.join(', ')}]`)
+
+    // ─── Step 3: 遍历所有截图，收集 objectives 后合并存储 ───
+    const selectedContexts = matchedContexts.filter(ctx => selectedIds.includes(ctx.id))
+    const collectedObjectives: OkrObjective[] = []
+    let lastSourceDescription = ''
+    let lastSourceImagePath = ''
+
+    for (const ctx of selectedContexts) {
+      console.log(`[OKR] Step3: 提取 OKR: ${ctx.ai_summary.substring(0, 100)}`)
+      const result = await extractOkrObjectivesFromImage(ctx.image_local_path, openai, modelName)
+      if (result) {
+        collectedObjectives.push(...result.objectives)
+        lastSourceDescription = result.sourceDescription
+        lastSourceImagePath = ctx.image_local_path
+      }
+    }
+
+    if (collectedObjectives.length === 0) {
+      console.log('[OKR] Step3: 所有筛选出的截图均未提取到有效 OKR 结构，等待后续截图')
+      return
+    }
+
+    // 合并去重后一次性存储
+    saveOkrToSettings(collectedObjectives, lastSourceDescription, lastSourceImagePath)
+    console.log('[OKR] ✅ OKR 智能扫描完成，已从多张截图合并提取')
+  } catch (error) {
+    console.error('[OKR] LLM 筛选失败，跳过本次扫描:', error instanceof Error ? error.message : error)
   }
 }
 
@@ -423,7 +729,8 @@ async function processTieredSummaries(): Promise<void> {
  */
 export async function generateStatsInsight(
   start: number,
-  end: number
+  end: number,
+  cycle?: 'day' | 'week' | 'month'
 ): Promise<{ insight_text: string; warning_text?: string }> {
   const apiKey = db.getSetting('api_key')
   const endpoint = db.getSetting('endpoint')
@@ -448,21 +755,62 @@ export async function generateStatsInsight(
     }
   }
 
+  const dayNames = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+
   const contextTexts = filteredSummaries
-    .map((s) => `- [${new Date(s.timestamp).toLocaleTimeString()}] ${s.content}`)
+    .map((s) => {
+      const date = new Date(s.timestamp)
+      if (cycle === 'week') {
+        const dateStr = `${date.getMonth() + 1}/${date.getDate()} ${dayNames[date.getDay()]}`
+        return `- [${dateStr}] ${s.content}`
+      } else if (cycle === 'month') {
+        const dateStr = `${date.getMonth() + 1}/${date.getDate()}`
+        return `- [${dateStr}] ${s.content}`
+      }
+      return `- [${date.toLocaleTimeString()}] ${s.content}`
+    })
     .join('\n')
 
+  const now = new Date()
+  let progressInfo = ''
+  if (cycle === 'week') {
+    const dayOfWeek = now.getDay()
+    const weekDayName = dayNames[dayOfWeek]
+    progressInfo = `今天是${weekDayName}（${now.getMonth() + 1}月${now.getDate()}日），本周已过 ${dayOfWeek === 0 ? 7 : dayOfWeek}/7 天。`
+  } else if (cycle === 'month') {
+    const dayOfMonth = now.getDate()
+    const lastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate()
+    progressInfo = `今天是${now.getMonth() + 1}月${dayOfMonth}日，本月共 ${lastDay} 天，已过 ${dayOfMonth}/${lastDay} 天。`
+  }
+
   try {
+    const cyclePromptMap: Record<string, string> = {
+      day: 'stats_insight_daily',
+      week: 'stats_insight_weekly',
+      month: 'stats_insight_monthly'
+    }
+    const promptName = cycle ? (cyclePromptMap[cycle] || 'stats_insight') : 'stats_insight'
+
+    let systemPrompt = loadPrompt(promptName) || '生成生产力洞察报告并返回 JSON。'
+    if (progressInfo) {
+      systemPrompt = systemPrompt.replace('[PROGRESS_INFO]', progressInfo)
+    }
+
+    let userMessage = `这是用户在该时段内的行为总结：\n${contextTexts}`
+    if (progressInfo) {
+      userMessage = `【当前进度】${progressInfo}\n\n${userMessage}`
+    }
+
     const response = await openai.chat.completions.create({
       model: modelName,
       messages: [
         {
           role: 'system',
-          content: loadPrompt('stats_insight') || '生成生产力洞察报告并返回 JSON。'
+          content: systemPrompt
         },
         {
           role: 'user',
-          content: `这是用户在该时段内的行为总结：\n${contextTexts}`
+          content: userMessage
         }
       ],
       response_format: { type: 'json_object' }
@@ -483,6 +831,106 @@ export async function generateStatsInsight(
     return {
       insight_text: 'AI 洞察生成失败，请检查网络连接或 API 配置。'
     }
+  }
+}
+
+/**
+ * 为指定日期生成日报（复用 stats_insight_daily prompt）并持久化到 daily_reports 表。
+ * 如果数据库中已有该日期的日报，直接返回（不重复生成）。
+ */
+export async function generateDailyReport(
+  date: string
+): Promise<{ insight_text: string; warning_text?: string; generated: boolean }> {
+  // 先检查数据库中是否已有该日期的日报
+  const existing = db.getDailyReport(date)
+  if (existing) {
+    return {
+      insight_text: existing.insight_text,
+      warning_text: existing.warning_text ?? undefined,
+      generated: false
+    }
+  }
+
+  const apiKey = db.getSetting('api_key')
+  const endpoint = db.getSetting('endpoint')
+  const modelName = db.getSetting('model_name') || 'qwen3.5-plus'
+
+  if (!apiKey || !endpoint) {
+    throw new Error('API Key 或 Endpoint 未配置')
+  }
+
+  // 优先使用 slot_summaries（15分钟槽归纳），fallback 到 contexts（原始截图记录）
+  const slotSummaries = db.getSlotSummariesForDate(date)
+  let contextTexts: string
+
+  if (slotSummaries.length > 0) {
+    contextTexts = slotSummaries
+      .sort((a, b) => a.slot_start_ms - b.slot_start_ms)
+      .map((slot) => {
+        const time = new Date(slot.slot_start_ms)
+        return `- [${time.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}] ${slot.summary}`
+      })
+      .join('\n')
+  } else {
+    // Fallback: 从 contexts 表获取当天的截图记录
+    const contexts = db.getContextsForDate(date) as { timestamp: number; ai_summary: string }[]
+    if (contexts.length === 0) {
+      return { insight_text: '当天没有记录到任何工作数据。', generated: false }
+    }
+    contextTexts = contexts
+      .sort((a, b) => a.timestamp - b.timestamp)
+      .map((ctx) => {
+        const time = new Date(ctx.timestamp)
+        return `- [${time.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}] ${ctx.ai_summary || '(无描述)'}`
+      })
+      .join('\n')
+  }
+
+  const openai = new OpenAI({
+    apiKey,
+    baseURL: endpoint.trim().replace(/\/+$/, '')
+  })
+
+  const systemPrompt = REPORT_PERSONAL_GENERATE_PROMPT
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: modelName,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        {
+          role: 'user',
+          content: [
+            `report_type: daily`,
+            `date_range: ${date}`,
+            `language: zh`,
+            `user_notes: 无`,
+            ``,
+            `slot_summaries:`,
+            contextTexts
+          ].join('\n')
+        }
+      ]
+    })
+
+    const content = response.choices[0].message.content
+    if (!content) throw new Error('AI 返回内容为空')
+
+    console.log(`[DailyReport] ${date} 日报生成完成`)
+
+    const usage = response.usage?.total_tokens || 0
+    db.saveTokenUsage(usage, modelName, 'daily_report')
+
+    // 新 prompt 返回 Markdown 格式，直接作为 insight_text 存储
+    const reportMarkdown = content.trim()
+
+    // 持久化到 daily_reports 表
+    db.saveDailyReport(date, reportMarkdown)
+
+    return { insight_text: reportMarkdown, generated: true }
+  } catch (error) {
+    console.error(`[DailyReport] ${date} 日报生成失败:`, (error as Error).message)
+    throw error
   }
 }
 
@@ -712,6 +1160,153 @@ export function stopSlotSummaryLoop(): void {
  * 后端异步执行 Backlog 的 AI 优化（合并、更新进度、分配优先级）
  */
 /**
+ * 冷启动：基于当天所有行为数据，一次性生成分层待办任务（backlog/week/month）。
+ * 当检测到当天 backlog 为空且有足够的行为数据时自动触发，也可通过 IPC 手动触发。
+ */
+export async function bootstrapBacklogFromHistory(): Promise<{ created: number; summary: string }> {
+  const apiKey = db.getSetting('api_key')
+  const endpoint = db.getSetting('endpoint')
+  const modelName = db.getSetting('model_name') || 'gpt-4o'
+
+  if (!apiKey || !endpoint) {
+    console.log('[Bootstrap] 跳过：API 未配置')
+    return { created: 0, summary: '' }
+  }
+
+  const today = new Date().toISOString().split('T')[0]
+
+  // 收集当天所有 slot 总结
+  const slotSummaries = db.getSlotSummariesForDate(today) as { slot_start_ms: number; summary: string }[]
+  if (slotSummaries.length < 2) {
+    console.log(`[Bootstrap] 跳过：行为数据不足 (slots: ${slotSummaries.length})`)
+    return { created: 0, summary: '行为数据不足，等待更多截图分析' }
+  }
+
+  // 提取 slot 总结文本
+  const summaryTexts = slotSummaries.map((slot) => {
+    const time = new Date(slot.slot_start_ms).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+    try {
+      const parsed = JSON.parse(slot.summary)
+      return `[${time}] ${parsed.title || parsed.description || slot.summary}`
+    } catch {
+      return `[${time}] ${slot.summary}`
+    }
+  })
+
+  // 收集已有任务标题（去重用）
+  const allBacklog = db.getBacklog() as { id: string; title: string; task_date: string; is_hidden: number }[]
+  const existingTitles = allBacklog
+    .filter(item => !item.is_hidden)
+    .map(item => item.title)
+
+  // 读取用户 OKR
+  const currentOkr = db.getSetting('okr_current') || ''
+
+  // 加载 prompt
+  const bootstrapPrompt = loadPrompt('backlog_bootstrap')
+  if (!bootstrapPrompt) {
+    console.error('[Bootstrap] 无法加载 backlog_bootstrap prompt')
+    return { created: 0, summary: 'prompt 加载失败' }
+  }
+
+  console.log(`[Bootstrap] 开始全量分析... (slots: ${slotSummaries.length}, 已有任务: ${existingTitles.length})`)
+
+  try {
+    const openai = new OpenAI({ apiKey, baseURL: endpoint.trim().replace(/\/+$/, '') })
+
+    const userContent = [
+      `### slot_summaries:\n${summaryTexts.join('\n')}`,
+      `\n### existing_tasks:\n${JSON.stringify(existingTitles)}`,
+      currentOkr ? `\n### user_okr:\n${currentOkr}` : ''
+    ].filter(Boolean).join('\n')
+
+    const response = await openai.chat.completions.create({
+      model: modelName,
+      messages: [
+        { role: 'system', content: bootstrapPrompt },
+        { role: 'user', content: userContent }
+      ],
+      response_format: { type: 'json_object' }
+    })
+
+    const content = response.choices[0].message.content
+    if (!content) {
+      console.error('[Bootstrap] AI 返回空内容')
+      return { created: 0, summary: 'AI 返回空内容' }
+    }
+
+    const result = JSON.parse(content) as {
+      tasks: { title: string; description?: string; category: string; priority?: number }[]
+      analysis_summary?: string
+    }
+
+    const usage = response.usage?.total_tokens || 0
+    db.saveTokenUsage(usage, modelName, 'backlog_bootstrap')
+
+    if (!result.tasks || !Array.isArray(result.tasks)) {
+      console.log('[Bootstrap] AI 未返回有效任务')
+      return { created: 0, summary: result.analysis_summary || '' }
+    }
+
+    // 本地去重 + 写入数据库
+    const existingLower = existingTitles.map(t => t.toLowerCase().trim())
+    let createdCount = 0
+
+    for (const task of result.tasks) {
+      if (!task.title || task.title.trim() === '') continue
+
+      const normalizedTitle = task.title.toLowerCase().trim()
+      const isDuplicate = existingLower.some(existing =>
+        existing === normalizedTitle ||
+        existing.includes(normalizedTitle) ||
+        normalizedTitle.includes(existing)
+      )
+
+      if (isDuplicate) {
+        console.log(`[Bootstrap] 跳过重复任务: "${task.title}"`)
+        continue
+      }
+
+      const validCategories = new Set(['backlog', 'week', 'month'])
+      const category = validCategories.has(task.category) ? task.category : 'backlog'
+      const priority = typeof task.priority === 'number' && task.priority >= 1 && task.priority <= 5
+        ? task.priority
+        : 3
+
+      const taskId = `bootstrap_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+      db.addBacklogItem({
+        id: taskId,
+        title: task.title.trim(),
+        description: task.description?.trim() || '',
+        progress: 0,
+        subtasks: '',
+        color: category === 'month' ? 'bg-purple-500' : category === 'week' ? 'bg-blue-500' : 'bg-indigo-500',
+        category,
+        project_id: null,
+        created_at: Date.now(),
+        priority
+      })
+
+      existingLower.push(normalizedTitle)
+      createdCount++
+      console.log(`[Bootstrap] 创建任务 [${category}]: "${task.title}"`)
+    }
+
+    // 通知前端刷新
+    if (createdCount > 0) {
+      const windows = BrowserWindow.getAllWindows()
+      windows.forEach(w => w.webContents.send('backlog-updated'))
+    }
+
+    console.log(`[Bootstrap] 完成：创建 ${createdCount} 个任务`)
+    return { created: createdCount, summary: result.analysis_summary || '' }
+  } catch (error) {
+    console.error('[Bootstrap] 全量分析失败:', (error as Error).message)
+    return { created: 0, summary: (error as Error).message }
+  }
+}
+
+/**
  * 后端异步执行 Backlog 的 AI 分析：
  * - 识别最近活动中出现的新待办任务，追加到数据库
  * - 识别已完成的任务，更新完成状态
@@ -729,6 +1324,16 @@ async function optimizeBacklogState(newActivity?: string): Promise<void> {
     const today = new Date().toISOString().split('T')[0]
     const allBacklog = db.getBacklog() as { id: string; title: string; description?: string; priority: number; completed: number; task_date: string; is_hidden: number }[]
     const todayItems = allBacklog.filter(item => item.task_date === today && !item.is_hidden)
+
+    // 冷启动检测：当天无任何任务时，触发全量分析
+    if (todayItems.length === 0) {
+      console.log('[Capturer] 检测到当天 backlog 为空，触发冷启动全量分析...')
+      const bootstrapResult = await bootstrapBacklogFromHistory()
+      if (bootstrapResult.created > 0) {
+        console.log(`[Capturer] 冷启动完成，已创建 ${bootstrapResult.created} 个任务，跳过增量分析`)
+        return
+      }
+    }
 
     // 聚合最近的 slot summaries 作为更丰富的 recent_activity 上下文
     const recentSlotSummaries = db.getSlotSummariesForDate(today)
@@ -833,8 +1438,8 @@ async function optimizeBacklogState(newActivity?: string): Promise<void> {
             for (const taskId of completionResult.completed_task_ids as string[]) {
               const originalTask = uncompletedTasks.find(item => item.id === taskId)
               if (!originalTask) continue
-              db.updateBacklogStatus(taskId, true)
-              console.log(`[Capturer] 任务已标记完成: "${originalTask.title}"`)
+              db.updateBacklogStatus(taskId, true, 'ai')
+              console.log(`[Capturer] 任务已标记完成(AI识别): "${originalTask.title}"`)
               hasChanges = true
             }
           }
@@ -889,6 +1494,65 @@ async function optimizeBacklogState(newActivity?: string): Promise<void> {
         db.saveTokenUsage(priorityTokens, modelName || 'gpt-4o', 'task_priority')
       } catch (error) {
         console.error('[Capturer] Step3 优先级评估失败:', error)
+      }
+    }
+
+    // OKR 主动扫描已移除：改为用户手动录入文字后 AI 解析
+
+    // ─── Step 4: OKR 驱动的长线任务分类（将 backlog 任务提升为 week/month）──────────
+    const classifiableBacklog = db.getBacklog() as { id: string; title: string; description?: string; category: string; priority?: number; completed: number; task_date: string; is_hidden: number }[]
+    const backlogOnlyTasks = classifiableBacklog.filter(
+      item => !item.completed && !item.is_hidden && (!item.category || item.category === 'backlog')
+    )
+    if (backlogOnlyTasks.length > 0) {
+      console.log(`[Capturer] Step4: OKR 驱动的长线任务分类... (backlog 任务: ${backlogOnlyTasks.length})`)
+      try {
+        const tasksForClassification = backlogOnlyTasks.map(item => ({
+          id: item.id,
+          title: item.title,
+          description: item.description || ''
+        }))
+
+        // 读取用户 OKR 用于任务对齐
+        const currentOkr = db.getSetting('okr_current')
+        let okrSection = ''
+        if (currentOkr) {
+          const okrUpdatedAt = db.getSetting('okr_updated_at') || '未知'
+          okrSection = `\n\n### user_okr (最后更新: ${okrUpdatedAt}):\n${currentOkr}`
+          console.log('[Capturer] Step4: 已加载用户 OKR 用于任务对齐')
+        }
+
+        const classificationResponse = await openai.chat.completions.create({
+          model: modelName || 'gpt-4o',
+          messages: [
+            { role: 'system', content: TASK_CLASSIFICATION_PROMPT },
+            { role: 'user', content: `### backlog_tasks:\n${JSON.stringify(tasksForClassification, null, 2)}\n\n### recent_activity:\n${fullRecentActivity}${okrSection}` }
+          ],
+          response_format: { type: 'json_object' }
+        })
+
+        const classificationContent = classificationResponse.choices[0].message.content
+        if (classificationContent) {
+          const classificationResult = JSON.parse(classificationContent)
+          if (classificationResult.classifications && Array.isArray(classificationResult.classifications)) {
+            for (const classification of classificationResult.classifications as { task_id: string; new_category: string; reason: string }[]) {
+              const validCategories = new Set(['week', 'month'])
+              if (!validCategories.has(classification.new_category)) continue
+
+              const targetTask = backlogOnlyTasks.find(item => item.id === classification.task_id)
+              if (!targetTask) continue
+
+              const taskPriority = 'priority' in targetTask ? (targetTask as { priority?: number }).priority ?? 3 : 3
+              db.reclassifyTask(classification.task_id, classification.new_category, taskPriority)
+              console.log(`[Capturer] 任务提升为 ${classification.new_category}: "${targetTask.title}" (${classification.reason})`)
+              hasChanges = true
+            }
+          }
+        }
+        const classificationTokens = classificationResponse.usage?.total_tokens || 0
+        db.saveTokenUsage(classificationTokens, modelName || 'gpt-4o', 'task_classification')
+      } catch (error) {
+        console.error('[Capturer] Step4 长线任务分类失败:', error)
       }
     }
 
@@ -1141,11 +1805,20 @@ async function generateAndCacheInsight(cycle: 'day' | 'week' | 'month'): Promise
     baseURL: endpoint.trim().replace(/\/+$/, '')
   })
 
-  // 将 slot_summaries 的 JSON 内容提取为可读文本
+  // 将 slot_summaries 的 JSON 内容提取为可读文本，周/月报使用宏观时间粒度
+  const dayNames = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
   const contextTexts = slotSummaries.map((s) => {
-    const timeStr = new Date(s.slot_start_ms).toLocaleString('zh-CN', {
-      month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit'
-    })
+    const date = new Date(s.slot_start_ms)
+    let timeStr: string
+    if (cycle === 'week') {
+      timeStr = `${date.getMonth() + 1}/${date.getDate()} ${dayNames[date.getDay()]}`
+    } else if (cycle === 'month') {
+      timeStr = `${date.getMonth() + 1}/${date.getDate()}`
+    } else {
+      timeStr = date.toLocaleString('zh-CN', {
+        month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit'
+      })
+    }
     try {
       const parsed = JSON.parse(s.summary)
       return `- [${timeStr}] ${parsed.title || ''}: ${parsed.description || ''}`
@@ -1154,17 +1827,47 @@ async function generateAndCacheInsight(cycle: 'day' | 'week' | 'month'): Promise
     }
   }).join('\n')
 
+  // 生成周/月进度信息
+  const currentDate = new Date()
+  let progressInfo = ''
+  if (cycle === 'week') {
+    const dayOfWeek = currentDate.getDay()
+    const weekDayName = dayNames[dayOfWeek]
+    progressInfo = `今天是${weekDayName}（${currentDate.getMonth() + 1}月${currentDate.getDate()}日），本周已过 ${dayOfWeek === 0 ? 7 : dayOfWeek}/7 天。`
+  } else if (cycle === 'month') {
+    const dayOfMonth = currentDate.getDate()
+    const lastDay = new Date(currentDate.getFullYear(), currentDate.getMonth() + 1, 0).getDate()
+    progressInfo = `今天是${currentDate.getMonth() + 1}月${dayOfMonth}日，本月共 ${lastDay} 天，已过 ${dayOfMonth}/${lastDay} 天。`
+  }
+
   try {
+    const cyclePromptMap: Record<string, string> = {
+      day: 'stats_insight_daily',
+      week: 'stats_insight_weekly',
+      month: 'stats_insight_monthly'
+    }
+    const promptName = cyclePromptMap[cycle] || 'stats_insight'
+
+    let systemPrompt = loadPrompt(promptName) || '生成生产力洞察报告并返回 JSON。'
+    if (progressInfo) {
+      systemPrompt = systemPrompt.replace('[PROGRESS_INFO]', progressInfo)
+    }
+
+    let userMessage = `这是用户在该时段内的行为总结（共 ${slotSummaries.length} 个15分钟时段）：\n${contextTexts}`
+    if (progressInfo) {
+      userMessage = `【当前进度】${progressInfo}\n\n${userMessage}`
+    }
+
     const response = await openai.chat.completions.create({
       model: modelName,
       messages: [
         {
           role: 'system',
-          content: loadPrompt('stats_insight') || '生成生产力洞察报告并返回 JSON。'
+          content: systemPrompt
         },
         {
           role: 'user',
-          content: `这是用户在该时段内的行为总结（共 ${slotSummaries.length} 个15分钟时段）：\n${contextTexts}`
+          content: userMessage
         }
       ],
       response_format: { type: 'json_object' }
@@ -1228,5 +1931,90 @@ export function stopInsightCacheLoop(): void {
     console.log('[InsightCache] 停止洞察报告定时缓存任务')
     clearInterval(insightCacheTimer)
     insightCacheTimer = null
+  }
+}
+
+// ==================== 日报定时生成任务 ====================
+
+let dailyReportTimer: NodeJS.Timeout | null = null
+const DAILY_REPORT_CHECK_INTERVAL_MS = 60 * 1000 // 每分钟检查一次是否到了 10:30
+
+/**
+ * 获取昨天的日期字符串 (YYYY-MM-DD)
+ */
+function getYesterdayDateString(): string {
+  const yesterday = new Date()
+  yesterday.setDate(yesterday.getDate() - 1)
+  return `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, '0')}-${String(yesterday.getDate()).padStart(2, '0')}`
+}
+
+/**
+ * 定时检查：如果当前时间是 10:30 且昨天的日报尚未生成，则自动生成
+ */
+async function runDailyReportTick(): Promise<void> {
+  const now = new Date()
+  const hour = now.getHours()
+  const minute = now.getMinutes()
+
+  // 只在 10:30 这一分钟内触发（每分钟检查一次，所以只会命中一次）
+  if (hour !== 10 || minute !== 30) return
+
+  const yesterday = getYesterdayDateString()
+  const existing = db.getDailyReport(yesterday)
+  if (existing) {
+    console.log(`[DailyReport] ${yesterday} 日报已存在，跳过定时生成`)
+    return
+  }
+
+  console.log(`[DailyReport] 定时任务触发：开始生成 ${yesterday} 的日报...`)
+  try {
+    await generateDailyReport(yesterday)
+    console.log(`[DailyReport] 定时任务完成：${yesterday} 日报已生成并持久化`)
+  } catch (error) {
+    console.error(`[DailyReport] 定时任务失败：${yesterday}`, (error as Error).message)
+  }
+}
+
+export function startDailyReportLoop(): void {
+  if (dailyReportTimer) {
+    clearInterval(dailyReportTimer)
+  }
+  console.log('[DailyReport] 启动日报定时生成任务（每天 10:30 自动生成上一天日报）...')
+
+  dailyReportTimer = setInterval(() => {
+    runDailyReportTick().catch((err) => console.error('[DailyReport] 定时检查失败:', err))
+  }, DAILY_REPORT_CHECK_INTERVAL_MS)
+}
+
+export function stopDailyReportLoop(): void {
+  if (dailyReportTimer) {
+    console.log('[DailyReport] 停止日报定时生成任务')
+    clearInterval(dailyReportTimer)
+    dailyReportTimer = null
+  }
+}
+
+/**
+ * 启动时兜底检查：如果当前时间在 0:00-10:30 之间，且昨天的日报尚未生成，则立即生成。
+ * 用于覆盖"用户在 10:30 之前打开应用"的场景。
+ */
+export async function ensureYesterdayReportOnStartup(): Promise<void> {
+  const now = new Date()
+  const hour = now.getHours()
+  const minute = now.getMinutes()
+  const isBeforeScheduledTime = hour < 10 || (hour === 10 && minute < 30)
+
+  if (!isBeforeScheduledTime) return
+
+  const yesterday = getYesterdayDateString()
+  const existing = db.getDailyReport(yesterday)
+  if (existing) return
+
+  console.log(`[DailyReport] 启动兜底：当前时间 ${hour}:${String(minute).padStart(2, '0')}，尝试生成 ${yesterday} 的日报...`)
+  try {
+    await generateDailyReport(yesterday)
+    console.log(`[DailyReport] 启动兜底完成：${yesterday} 日报已生成并持久化`)
+  } catch (error) {
+    console.error(`[DailyReport] 启动兜底失败：${yesterday}`, (error as Error).message)
   }
 }

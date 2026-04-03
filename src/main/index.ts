@@ -19,8 +19,16 @@ import {
   startInsightCacheLoop,
   stopInsightCacheLoop,
   generateStatsInsight,
-  setAppDataPath
+  generateDailyReport,
+  setAppDataPath,
+  parseOkrFromText,
+  bootstrapBacklogFromHistory,
+  startDailyReportLoop,
+  stopDailyReportLoop,
+  ensureYesterdayReportOnStartup
 } from './capturer'
+import { setMaintenanceBasePath } from './maintenance'
+import { generateReport, refineReport, translateReport } from './reportGenerator'
 import {
   installOpenclaw,
   syncApiKeyToOpenclaw,
@@ -296,13 +304,16 @@ app.whenReady().then(() => {
   // Set app user model id for windows
   electronApp.setAppUserModelId('com.electron')
 
-  // 初始化迁移
+  // 初始化迁移（仅在打包后的生产环境执行，dev 模式下不需要迁移）
   const userDataPath = app.getPath('userData')
-  migrateData(userDataPath)
+  if (!is.dev) {
+    migrateData(userDataPath)
+  }
 
   // 初始化数据库，必须在 app ready 之后调用 getPath
   db.initDatabase(userDataPath)
   setAppDataPath(userDataPath)
+  setMaintenanceBasePath(userDataPath)
 
   // 跨日继承：将历史未完成任务迁移到今天
   const inheritedCount = db.inheritUnfinishedTasks()
@@ -329,6 +340,10 @@ app.whenReady().then(() => {
   })
   ipcMain.handle('get-contexts', (_, date) => {
     return db.getContextsForDate(date)
+  })
+
+  ipcMain.handle('get-context-detail', (_, contextId: number) => {
+    return db.getContextDetail(contextId)
   })
 
   ipcMain.handle('update-backlog-status', (_, id, completed) => {
@@ -398,7 +413,7 @@ app.whenReady().then(() => {
       }
     }
     // 缓存不存在时回退到实时生成
-    return generateStatsInsight(start, end)
+    return generateStatsInsight(start, end, cycle as 'day' | 'week' | 'month' | undefined)
   })
 
   ipcMain.handle('get-monthly-tokens', () => {
@@ -415,6 +430,57 @@ app.whenReady().then(() => {
 
   ipcMain.handle('get-summaries-for-date', (_, date, level) => {
     return db.getSummariesForDate(date, level)
+  })
+
+  // ─── Report Generation IPC Handlers ─────────────────────────────────────────
+
+  ipcMain.handle('generate-report', async (_, params: {
+    reportType: 'daily' | 'weekly' | 'monthly'
+    version: 'personal' | 'professional'
+    startMs: number
+    endMs: number
+    userNotes: string
+    language: 'zh' | 'en'
+  }) => {
+    try {
+      console.log(`[Main] Generating ${params.version} ${params.reportType} report`)
+      const report = await generateReport(params)
+      return { success: true, report }
+    } catch (error) {
+      console.error('[Main] Report generation failed:', (error as Error).message)
+      return { success: false, error: (error as Error).message }
+    }
+  })
+
+  ipcMain.handle('refine-report', async (_, params: {
+    originalData: string
+    previousReport: string
+    userFeedback: string
+    language: 'zh' | 'en'
+    version: 'personal' | 'professional'
+  }) => {
+    try {
+      console.log('[Main] Refining report')
+      const report = await refineReport(params)
+      return { success: true, report }
+    } catch (error) {
+      console.error('[Main] Report refinement failed:', (error as Error).message)
+      return { success: false, error: (error as Error).message }
+    }
+  })
+
+  ipcMain.handle('translate-report', async (_, params: {
+    report: string
+    targetLanguage: 'zh' | 'en'
+  }) => {
+    try {
+      console.log(`[Main] Translating report to ${params.targetLanguage}`)
+      const report = await translateReport(params)
+      return { success: true, report }
+    } catch (error) {
+      console.error('[Main] Report translation failed:', (error as Error).message)
+      return { success: false, error: (error as Error).message }
+    }
   })
 
   // IPC handlers for permissions
@@ -440,17 +506,62 @@ app.whenReady().then(() => {
       startSlotSummaryLoop()
       startDailyPricingLoop()
       startInsightCacheLoop()
+      startDailyReportLoop()
+
+      // 启动时兜底：0:00-10:30 之间自动生成昨天的日报
+      ensureYesterdayReportOnStartup().catch((err) =>
+        console.error('[Main] Ensure yesterday report failed:', (err as Error).message)
+      )
+
+      // 延迟 10 秒后触发 backlog 冷启动检查
+      setTimeout(() => {
+        bootstrapBacklogFromHistory().catch((err) =>
+          console.error('[Main] Bootstrap backlog failed:', (err as Error).message)
+        )
+      }, 10_000)
     } else {
       console.log('[Main] Stopping capture loop')
       stopCaptureLoop()
       stopSlotSummaryLoop()
       stopDailyPricingLoop()
       stopInsightCacheLoop()
+      stopDailyReportLoop()
     }
   })
 
   ipcMain.handle('get-slot-summaries', (_, date: string) => {
     return db.getSlotSummariesForDate(date)
+  })
+
+  ipcMain.handle('get-daily-report-dates', () => {
+    // 合并两个来源：已生成日报的日期 + 有数据但尚未生成日报的日期
+    const reportDates = new Set(db.getDailyReportDates())
+    const contextDates = db.getDistinctContextDates()
+    for (const date of contextDates) {
+      reportDates.add(date)
+    }
+    return Array.from(reportDates).sort().reverse()
+  })
+
+  ipcMain.handle('get-daily-report', async (_, date: string) => {
+    try {
+      // 1. 先从数据库直接读取已持久化的日报
+      const existing = db.getDailyReport(date)
+      if (existing) {
+        return {
+          success: true,
+          insight_text: existing.insight_text,
+          warning_text: existing.warning_text ?? undefined
+        }
+      }
+
+      // 2. 数据库中没有该日期的日报，立即生成并持久化
+      const result = await generateDailyReport(date)
+      return { success: true, insight_text: result.insight_text, warning_text: result.warning_text }
+    } catch (error) {
+      console.error('[Main] Daily report retrieval failed:', (error as Error).message)
+      return { success: false, insight_text: '', error: (error as Error).message }
+    }
   })
 
   ipcMain.handle('test-llm-connection', async (_, apiKey, endpoint, modelName) => {
@@ -649,6 +760,28 @@ ${JSON.stringify(simplifiedContexts)}
     return triggerManualScan()
   })
 
+  // IPC handler for parsing OKR from user-provided text
+  ipcMain.handle('parse-okr-text', async (_event, inputText: string) => {
+    try {
+      const result = await parseOkrFromText(inputText)
+      return result
+    } catch (error) {
+      console.error('[Main] OKR text parse failed:', (error as Error).message)
+      return { success: false, objectiveCount: 0, error: (error as Error).message }
+    }
+  })
+
+  // IPC handler for manual backlog bootstrap (cold start)
+  ipcMain.handle('bootstrap-backlog', async () => {
+    try {
+      const result = await bootstrapBacklogFromHistory()
+      return { success: true, created: result.created, summary: result.summary }
+    } catch (error) {
+      console.error('[Main] Backlog bootstrap failed:', (error as Error).message)
+      return { success: false, error: (error as Error).message }
+    }
+  })
+
   createWindow()
 
   // 应用启动时，若 AI 感知已开启则自动恢复捕获和槽摘要任务
@@ -661,6 +794,13 @@ ${JSON.stringify(simplifiedContexts)}
     startSlotSummaryLoop()
     startDailyPricingLoop()
     startInsightCacheLoop()
+
+    // 延迟 10 秒后触发 backlog 冷启动检查
+    setTimeout(() => {
+      bootstrapBacklogFromHistory().catch((err) =>
+        console.error('[Main] Bootstrap backlog on startup failed:', (err as Error).message)
+      )
+    }, 10_000)
   }
 
   // 应用启动时，若 OpenClaw 已安装则自动启动 Gateway
