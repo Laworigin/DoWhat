@@ -5,6 +5,20 @@
 
 ---
 
+## 2026-04-03: migrateData 缺乏幂等性导致 image_local_path 被反复拼接膨胀到 79657 字符
+
+- **问题**：打包后的应用每次启动都执行 `migrateData`，其中的 `REPLACE(image_local_path, oldPrefix, newPrefix)` SQL 会把已经包含 `userDataPath` 的路径再次替换拼接，导致路径指数级膨胀（从 ~100 字符膨胀到 79657 字符），截图缩略图全部无法加载显示为空白
+- **根因**：缺约束 — `migrateData` 函数没有幂等性保障（无迁移标记文件），每次启动都无条件执行路径替换
+- **修复**：
+  1. 添加 `.migration-completed` 标记文件实现幂等性，迁移完成后写入标记，后续启动直接跳过
+  2. 添加前置条件守卫：旧数据不存在时直接标记完成
+  3. 添加安全检查：仅替换确实以旧路径开头的记录
+  4. 用脚本扫描 snapshots 目录建立 timestamp→实际路径映射，批量修复 9025 条损坏记录
+- **系统改进**：已纳入硬约束 — **数据迁移必须有幂等性保障**（标记文件 + 前置条件守卫），`REPLACE` SQL 必须有精确的 WHERE 条件防止重复替换
+- **状态**：✅ 已修复，已纳入硬约束
+
+---
+
 ## 2026-04-01: Electron preload 修改后未重启 dev server 导致 window.api.xxx is not a function
 
 - **问题**：修改 `src/preload/index.ts` 新增了 `generateReport` 等 IPC 桥接方法后，前端调用 `window.api.generateReport()` 报错 `is not a function`

@@ -171,11 +171,26 @@ function createWindow(): void {
  * 自动迁移数据：从项目根目录迁移到 userData 目录
  */
 function migrateData(userDataPath: string): void {
+  const migrationMarker = path.join(userDataPath, '.migration-completed')
+
+  // 幂等性守卫：如果已经迁移过，直接跳过
+  if (fs.existsSync(migrationMarker)) {
+    console.log('[Migration] Already completed, skipping')
+    return
+  }
+
   const rootPath = process.cwd()
   const oldDbPath = path.join(rootPath, 'context_agent.db')
   const newDbPath = path.join(userDataPath, 'context_agent.db')
   const oldSnapshotsPath = path.join(rootPath, 'snapshots')
   const newSnapshotsPath = path.join(userDataPath, 'snapshots')
+
+  // 前置条件：旧数据必须存在才执行迁移
+  if (!fs.existsSync(oldDbPath) && !fs.existsSync(oldSnapshotsPath)) {
+    console.log('[Migration] No old data found, marking as completed')
+    fs.writeFileSync(migrationMarker, Date.now().toString())
+    return
+  }
 
   // 1. 迁移数据库
   if (fs.existsSync(oldDbPath)) {
@@ -194,50 +209,56 @@ function migrateData(userDataPath: string): void {
   }
 
   // 2. 迁移截图目录
-  if (fs.existsSync(oldSnapshotsPath)) {
-    if (!fs.existsSync(newSnapshotsPath)) {
-      console.log(`[Migration] Moving snapshots from ${oldSnapshotsPath} to ${newSnapshotsPath}`)
+  if (fs.existsSync(oldSnapshotsPath) && !fs.existsSync(newSnapshotsPath)) {
+    console.log(`[Migration] Moving snapshots from ${oldSnapshotsPath} to ${newSnapshotsPath}`)
+    try {
+      fs.mkdirSync(newSnapshotsPath, { recursive: true })
       try {
-        // 使用同步方法递归创建目录并复制/移动
-        fs.mkdirSync(newSnapshotsPath, { recursive: true })
-        // 简单重命名（如果跨分区会失败，但此处通常在同一个用户目录下）
-        try {
-          fs.renameSync(oldSnapshotsPath, newSnapshotsPath)
-          console.log('[Migration] Snapshots moved successfully')
-        } catch (renameErr) {
-          console.warn('[Migration] renameSync failed, falling back to recursive copy/delete')
-          // Fallback logic if needed, but for now focus on the DB
-        }
-      } catch (err) {
-        console.error('[Migration] Snapshots migration failed:', err)
+        fs.renameSync(oldSnapshotsPath, newSnapshotsPath)
+        console.log('[Migration] Snapshots moved successfully')
+      } catch (renameErr) {
+        console.warn('[Migration] renameSync failed, falling back to recursive copy/delete')
       }
+    } catch (err) {
+      console.error('[Migration] Snapshots migration failed:', err)
     }
   }
 
-  // 3. 更新数据库中的路径（如果数据库已迁移）
+  // 3. 更新数据库中的路径（仅当旧路径确实存在于数据库中时）
   if (fs.existsSync(newDbPath)) {
     try {
       const Database = require('better-sqlite3')
       const mdb = new Database(newDbPath)
 
-      // 将旧的项目根目录路径替换为新的 userData 路径
       const oldPrefix = rootPath
       const newPrefix = userDataPath
 
-      console.log(`[Migration] Updating database paths: ${oldPrefix} -> ${newPrefix}`)
+      // 安全检查：仅替换确实以旧路径开头的记录，避免重复替换
+      const affectedCount = mdb
+        .prepare(`SELECT COUNT(*) as cnt FROM contexts WHERE image_local_path LIKE ?`)
+        .get(`${oldPrefix}%`) as { cnt: number }
 
-      mdb.prepare(`
-        UPDATE contexts
-        SET image_local_path = REPLACE(image_local_path, ?, ?)
-        WHERE image_local_path LIKE ?
-      `).run(oldPrefix, newPrefix, `${oldPrefix}%`)
+      if (affectedCount.cnt > 0) {
+        console.log(`[Migration] Updating ${affectedCount.cnt} database paths: ${oldPrefix} -> ${newPrefix}`)
+        mdb.prepare(`
+          UPDATE contexts
+          SET image_local_path = REPLACE(image_local_path, ?, ?)
+          WHERE image_local_path LIKE ?
+        `).run(oldPrefix, newPrefix, `${oldPrefix}%`)
+        console.log('[Migration] Database paths updated successfully')
+      } else {
+        console.log('[Migration] No paths need updating')
+      }
 
       mdb.close()
-      console.log('[Migration] Database paths updated successfully')
     } catch (dbErr) {
       console.error('[Migration] Failed to update database paths:', dbErr)
     }
   }
+
+  // 标记迁移完成，后续启动不再执行
+  fs.writeFileSync(migrationMarker, Date.now().toString())
+  console.log('[Migration] Migration completed and marked')
 }
 
 // This method will be called when Electron has finished
