@@ -276,8 +276,13 @@ export const BacklogView: React.FC = () => {
   const todayTasks = tasks.filter(
     (t) => !t.is_hidden && (!t.task_date || t.task_date === today)
   )
-  const activeTasks = todayTasks.filter((t) => !t.completed)
-  const completedTasks = todayTasks.filter((t) => t.completed)
+  // 展示上限：待处理最多 10 个，已完成最多 10 个，保持界面简洁聚焦
+  const maxDisplayActive = 10
+  const maxDisplayCompleted = 10
+  const allActiveTasks = todayTasks.filter((t) => !t.completed)
+  const allCompletedTasks = todayTasks.filter((t) => t.completed)
+  const activeTasks = allActiveTasks.slice(0, maxDisplayActive)
+  const completedTasks = allCompletedTasks.slice(0, maxDisplayCompleted)
 
   const loadDailyReport = async (date: string): Promise<void> => {
     setSelectedReportDate(date)

@@ -31,6 +31,7 @@ interface Window {
     checkScreenPermission: () => Promise<string>
     openSystemPreferences: () => Promise<void>
     toggleCapture: (shouldStart: boolean) => Promise<void>
+    getAiSensingStatus: () => Promise<boolean>
     testLLMConnection: (
       apiKey: string,
       endpoint: string,

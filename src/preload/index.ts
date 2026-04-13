@@ -24,6 +24,7 @@ const api = {
   checkScreenPermission: () => ipcRenderer.invoke('check-screen-permission'),
   openSystemPreferences: () => ipcRenderer.invoke('open-system-preferences'),
   toggleCapture: (shouldStart: boolean) => ipcRenderer.invoke('toggle-capture', shouldStart),
+  getAiSensingStatus: () => ipcRenderer.invoke('get-ai-sensing-status'),
   testLLMConnection: (apiKey: string, endpoint: string, modelName: string) =>
     ipcRenderer.invoke('test-llm-connection', apiKey, endpoint, modelName),
   aiSmartGrouping: (apiKey: string, endpoint: string, modelName: string, contexts: any[]) =>
@@ -36,6 +37,13 @@ const api = {
     ipcRenderer.invoke('ai-summarize-slot', apiKey, endpoint, modelName, summaries),
   getSlotSummaries: (date: string) =>
     ipcRenderer.invoke('get-slot-summaries', date),
+  getDailyWorkSummary: (date: string) =>
+    ipcRenderer.invoke('get-daily-work-summary', date),
+  getScheduledReports: (reportType?: string) =>
+    ipcRenderer.invoke('get-scheduled-reports', reportType),
+  getScheduledReportDetail: (reportType: string, version: string, dateRange: string) =>
+    ipcRenderer.invoke('get-scheduled-report-detail', reportType, version, dateRange),
+  triggerBatchReports: () => ipcRenderer.invoke('trigger-batch-reports'),
   getModelPricing: (modelName: string) =>
     ipcRenderer.invoke('get-model-pricing', modelName),
 

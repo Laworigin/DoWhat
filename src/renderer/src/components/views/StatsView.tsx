@@ -10,7 +10,9 @@ import {
   TrendingUp,
   TrendingDown,
   Sparkles,
-  AlertCircle
+  AlertCircle,
+  FileText,
+  ChevronLeft
 } from 'lucide-react'
 import { ReportExportModal } from '../ReportExportModal'
 
@@ -100,8 +102,174 @@ interface StatsData {
   prev_context_switches: number
 }
 
+// ─── 历史报告类型 ─────────────────────────────────────────────────────
+interface ScheduledReport {
+  report_type: string
+  version: string
+  date_range: string
+  report_text: string
+  generated_at: number
+}
+
+// ─── 历史报告视图组件 ─────────────────────────────────────────────────
+const HistoryReportView: React.FC = () => {
+  const [reports, setReports] = useState<ScheduledReport[]>([])
+  const [filterType, setFilterType] = useState<'all' | 'daily' | 'weekly' | 'monthly'>('all')
+  const [filterVersion, setFilterVersion] = useState<'all' | 'personal' | 'professional'>('all')
+  const [selectedReport, setSelectedReport] = useState<ScheduledReport | null>(null)
+  const [isLoading, setIsLoading] = useState(true)
+
+  useEffect(() => {
+    const loadReports = async (): Promise<void> => {
+      setIsLoading(true)
+      const typeParam = filterType === 'all' ? undefined : filterType
+      const data = await window.api.getScheduledReports(typeParam) as ScheduledReport[]
+      const filtered = filterVersion === 'all'
+        ? data
+        : data.filter(r => r.version === filterVersion)
+      setReports(filtered)
+      setIsLoading(false)
+    }
+    loadReports()
+  }, [filterType, filterVersion])
+
+  const typeLabel = (type: string): string => {
+    switch (type) {
+      case 'daily': return '日报'
+      case 'weekly': return '周报'
+      case 'monthly': return '月报'
+      default: return type
+    }
+  }
+
+  const versionLabel = (version: string): string => {
+    return version === 'personal' ? '个人版' : '专业版'
+  }
+
+  const typeColor = (type: string): string => {
+    switch (type) {
+      case 'daily': return 'bg-blue-500/20 text-blue-400'
+      case 'weekly': return 'bg-purple-500/20 text-purple-400'
+      case 'monthly': return 'bg-amber-500/20 text-amber-400'
+      default: return 'bg-gray-500/20 text-gray-400'
+    }
+  }
+
+  // 详情视图
+  if (selectedReport) {
+    return (
+      <div>
+        <button
+          onClick={() => setSelectedReport(null)}
+          className="flex items-center gap-1.5 text-[12px] text-gray-400 hover:text-white mb-6 transition-colors"
+        >
+          <ChevronLeft className="w-4 h-4" />
+          返回列表
+        </button>
+
+        <div className="flex items-center gap-3 mb-2">
+          <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${typeColor(selectedReport.report_type)}`}>
+            {typeLabel(selectedReport.report_type)}
+          </span>
+          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-white/10 text-gray-300">
+            {versionLabel(selectedReport.version)}
+          </span>
+        </div>
+        <h2 className="text-xl font-bold text-white mb-1">{selectedReport.date_range}</h2>
+        <p className="text-[11px] text-gray-500 mb-6">
+          生成于 {new Date(selectedReport.generated_at).toLocaleString('zh-CN')}
+        </p>
+
+        <div className="bg-white/5 border border-white/5 rounded-xl p-6">
+          <div className="prose prose-invert prose-sm max-w-none text-[13px] leading-relaxed text-gray-300 whitespace-pre-wrap">
+            {selectedReport.report_text}
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // 列表视图
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-8">
+        <div>
+          <h1 className="text-2xl font-bold text-white tracking-tight mb-1">历史报告</h1>
+          <p className="text-[13px] text-gray-500 font-medium">
+            自动生成的日报、周报、月报归档
+          </p>
+        </div>
+      </div>
+
+      {/* 筛选栏 */}
+      <div className="flex gap-3 mb-6">
+        <div className="flex bg-white/5 rounded-lg p-0.5">
+          {(['all', 'daily', 'weekly', 'monthly'] as const).map(type => (
+            <button
+              key={type}
+              onClick={() => setFilterType(type)}
+              className={`px-3 py-1.5 text-[11px] font-bold rounded-md transition-all ${filterType === type ? 'bg-white/15 text-white' : 'text-gray-500 hover:text-gray-300'}`}
+            >
+              {type === 'all' ? '全部' : typeLabel(type)}
+            </button>
+          ))}
+        </div>
+        <div className="flex bg-white/5 rounded-lg p-0.5">
+          {(['all', 'personal', 'professional'] as const).map(version => (
+            <button
+              key={version}
+              onClick={() => setFilterVersion(version)}
+              className={`px-3 py-1.5 text-[11px] font-bold rounded-md transition-all ${filterVersion === version ? 'bg-white/15 text-white' : 'text-gray-500 hover:text-gray-300'}`}
+            >
+              {version === 'all' ? '全部' : versionLabel(version)}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* 报告列表 */}
+      {isLoading ? (
+        <div className="text-center text-gray-500 py-12 animate-pulse">加载中...</div>
+      ) : reports.length === 0 ? (
+        <div className="text-center py-16">
+          <FileText className="w-12 h-12 text-gray-700 mx-auto mb-4" />
+          <p className="text-[13px] text-gray-500 font-medium">暂无历史报告</p>
+          <p className="text-[11px] text-gray-600 mt-1">
+            系统将在次日自动生成日报，每周一生成周报，每月初生成月报
+          </p>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {reports.map((report, index) => (
+            <div
+              key={`${report.report_type}-${report.version}-${report.date_range}-${index}`}
+              onClick={() => setSelectedReport(report)}
+              className="flex items-center justify-between p-4 bg-white/5 border border-white/5 rounded-xl hover:bg-white/[0.07] cursor-pointer transition-all group"
+            >
+              <div className="flex items-center gap-3">
+                <div className="flex gap-2">
+                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${typeColor(report.report_type)}`}>
+                    {typeLabel(report.report_type)}
+                  </span>
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-white/10 text-gray-300">
+                    {versionLabel(report.version)}
+                  </span>
+                </div>
+                <span className="text-[13px] font-medium text-white">{report.date_range}</span>
+              </div>
+              <span className="text-[11px] text-gray-600 group-hover:text-gray-400 transition-colors">
+                {new Date(report.generated_at).toLocaleDateString('zh-CN')}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export const StatsView: React.FC = () => {
-  const [activeCycle, setActiveCycle] = useState<'day' | 'week' | 'month'>('week')
+  const [activeCycle, setActiveCycle] = useState<'day' | 'week' | 'month' | 'history'>('week')
   const [stats, setStats] = useState<StatsData | null>(null)
   const [insight, setInsight] = useState<{ insight_text: string; warning_text?: string; updated_at?: number } | null>(
     null
@@ -111,6 +279,8 @@ export const StatsView: React.FC = () => {
   const [showReportModal, setShowReportModal] = useState(false)
 
   useEffect(() => {
+    if (activeCycle === 'history') return
+
     const loadStats = async (): Promise<void> => {
       const now = Date.now()
       let start: number
@@ -239,6 +409,12 @@ export const StatsView: React.FC = () => {
               active={activeCycle === 'month'}
               onClick={() => setActiveCycle('month')}
             />
+            <SecondaryNavItem
+              icon={FileText}
+              label="历史报告"
+              active={activeCycle === 'history'}
+              onClick={() => setActiveCycle('history')}
+            />
           </div>
         </div>
 
@@ -262,6 +438,10 @@ export const StatsView: React.FC = () => {
       {/* Main Content */}
       <div className="flex-1 p-8 overflow-y-auto custom-scrollbar">
         <div className="max-w-[1000px] w-full mx-auto">
+          {activeCycle === 'history' ? (
+            <HistoryReportView />
+          ) : (
+          <>
           {/* Header */}
           <div className="flex items-center justify-between mb-10">
             <div>
@@ -671,27 +851,31 @@ export const StatsView: React.FC = () => {
               </div>
             </div>
           </div>
+          </>
+          )}
         </div>
       </div>
 
       {/* Report Export Modal */}
-      <ReportExportModal
-        visible={showReportModal}
-        onClose={() => setShowReportModal(false)}
-        reportType={activeCycle === 'day' ? 'daily' : activeCycle === 'week' ? 'weekly' : 'monthly'}
-        startMs={(() => {
-          const now = Date.now()
-          const oneDay = 24 * 60 * 60 * 1000
-          if (activeCycle === 'day') {
-            const today = new Date()
-            today.setHours(0, 0, 0, 0)
-            return today.getTime()
-          }
-          if (activeCycle === 'week') return now - 7 * oneDay
-          return now - 30 * oneDay
-        })()}
-        endMs={Date.now()}
-      />
+      {activeCycle !== 'history' && (
+        <ReportExportModal
+          visible={showReportModal}
+          onClose={() => setShowReportModal(false)}
+          reportType={activeCycle === 'day' ? 'daily' : activeCycle === 'week' ? 'weekly' : 'monthly'}
+          startMs={(() => {
+            const now = Date.now()
+            const oneDay = 24 * 60 * 60 * 1000
+            if (activeCycle === 'day') {
+              const today = new Date()
+              today.setHours(0, 0, 0, 0)
+              return today.getTime()
+            }
+            if (activeCycle === 'week') return now - 7 * oneDay
+            return now - 30 * oneDay
+          })()}
+          endMs={Date.now()}
+        />
+      )}
     </div>
   )
 }

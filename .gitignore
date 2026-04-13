@@ -88,3 +88,4 @@ tests/
 # Test images (should not be committed)
 # ===========================
 src/main/img*.png
+upload_assets.py

@@ -342,6 +342,12 @@ app.whenReady().then(() => {
     console.log(`[Main] Inherited ${inheritedCount} unfinished tasks to today`)
   }
 
+  // 清理超出上限的低优先级待处理任务，保持每日列表简洁
+  const hiddenCount = db.cleanupExcessTasks(10)
+  if (hiddenCount > 0) {
+    console.log(`[Main] Cleaned up ${hiddenCount} excess tasks to keep daily list focused`)
+  }
+
   // Default open or close DevTools by F12 in development
   // and ignore CommandOrControl + R in production.
   // see https://github.com/alex8088/electron-toolkit/tree/master/packages/utils
@@ -422,10 +428,10 @@ app.whenReady().then(() => {
   })
 
   ipcMain.handle('get-stats-insight', async (_, start, end, cycle?: string) => {
-    // 优先从缓存读取，如果缓存存在则直接返回
+    // 优先从缓存读取，但必须校验缓存属于当前周期（防止跨周/跨月返回旧数据）
     if (cycle) {
       const cached = db.getInsightCache(cycle)
-      if (cached) {
+      if (cached && cached.updated_at >= start) {
         return {
           insight_text: cached.insight_text,
           warning_text: cached.warning_text,
@@ -433,7 +439,7 @@ app.whenReady().then(() => {
         }
       }
     }
-    // 缓存不存在时回退到实时生成
+    // 缓存不存在或已过期，回退到实时生成
     return generateStatsInsight(start, end, cycle as 'day' | 'week' | 'month' | undefined)
   })
 
@@ -518,6 +524,9 @@ app.whenReady().then(() => {
   })
 
   ipcMain.handle('toggle-capture', (_, shouldStart) => {
+    // 持久化 AI 感知状态，确保重启后能正确恢复
+    db.saveSetting('ai_sensing', shouldStart ? 'true' : 'false')
+
     if (shouldStart) {
       // 从数据库读取用户设置的频率，如果没有则默认 5 秒 (5000ms)
       const savedInterval = db.getSetting('capture_interval')
@@ -550,8 +559,113 @@ app.whenReady().then(() => {
     }
   })
 
+  ipcMain.handle('get-ai-sensing-status', () => {
+    return db.getSetting('ai_sensing') !== 'false'
+  })
+
   ipcMain.handle('get-slot-summaries', (_, date: string) => {
     return db.getSlotSummariesForDate(date)
+  })
+
+  ipcMain.handle('get-daily-work-summary', (_, date: string) => {
+    return db.getDailyWorkSummary(date) ?? null
+  })
+
+  ipcMain.handle('get-scheduled-reports', (_, reportType?: string) => {
+    if (reportType) {
+      return db.getScheduledReportsByType(reportType)
+    }
+    return db.getAllScheduledReports()
+  })
+
+  ipcMain.handle('get-scheduled-report-detail', (_, reportType: string, version: string, dateRange: string) => {
+    return db.getScheduledReport(reportType, version, dateRange)
+  })
+
+  // 临时：手动触发批量生成历史日报 + 上周周报
+  ipcMain.handle('trigger-batch-reports', async () => {
+    const { generateReport } = await import('./reportGenerator')
+    const versions: Array<'personal' | 'professional'> = ['personal', 'professional']
+    const results: string[] = []
+
+    // 1. 查询所有有截屏数据的日期
+    const allDates = db.getContextDatesWithData()
+
+    const today = new Date()
+    const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`
+
+    // 过滤掉今天（今天还没结束，不生成日报）
+    const historicalDates = allDates.filter(d => d !== todayStr)
+    results.push(`[BatchReport] 发现 ${historicalDates.length} 个历史日期有数据: ${historicalDates.join(', ')}`)
+    console.log(results[results.length - 1])
+
+    // 2. 为每个历史日期生成日报（个人版 + 专业版）
+    for (const dateStr of historicalDates) {
+      const dayStart = new Date(dateStr + 'T00:00:00')
+      const dayEnd = new Date(dateStr + 'T23:59:59.999')
+
+      for (const version of versions) {
+        const existing = db.getScheduledReport('daily', version, dateStr)
+        if (existing) {
+          results.push(`[BatchReport] 日报 ${version}/${dateStr} 已存在，跳过`)
+          console.log(results[results.length - 1])
+          continue
+        }
+        try {
+          console.log(`[BatchReport] 生成日报 ${version}/${dateStr}...`)
+          const report = await generateReport({
+            reportType: 'daily', version,
+            startMs: dayStart.getTime(), endMs: dayEnd.getTime(),
+            userNotes: '', language: 'zh'
+          })
+          db.saveScheduledReport('daily', version, dateStr, report)
+          results.push(`[BatchReport] ✅ 日报 ${version}/${dateStr} 生成成功`)
+          console.log(results[results.length - 1])
+        } catch (error) {
+          const msg = `[BatchReport] ❌ 日报 ${version}/${dateStr} 失败: ${(error as Error).message}`
+          results.push(msg)
+          console.error(msg)
+        }
+      }
+    }
+
+    // 3. 生成上周周报（个人版 + 专业版）
+    const lastMonday = new Date(today)
+    const dow = today.getDay()
+    lastMonday.setDate(today.getDate() - (dow === 0 ? 13 : dow + 6))
+    lastMonday.setHours(0, 0, 0, 0)
+    const lastSunday = new Date(lastMonday)
+    lastSunday.setDate(lastMonday.getDate() + 6)
+    lastSunday.setHours(23, 59, 59, 999)
+    const fmtDate = (d: Date): string =>
+      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+    const weekRange = `${fmtDate(lastMonday)} ~ ${fmtDate(lastSunday)}`
+
+    for (const version of versions) {
+      const existing = db.getScheduledReport('weekly', version, weekRange)
+      if (existing) {
+        results.push(`[BatchReport] 周报 ${version}/${weekRange} 已存在，跳过`)
+        console.log(results[results.length - 1])
+        continue
+      }
+      try {
+        console.log(`[BatchReport] 生成周报 ${version}/${weekRange}...`)
+        const report = await generateReport({
+          reportType: 'weekly', version,
+          startMs: lastMonday.getTime(), endMs: lastSunday.getTime(),
+          userNotes: '', language: 'zh'
+        })
+        db.saveScheduledReport('weekly', version, weekRange, report)
+        results.push(`[BatchReport] ✅ 周报 ${version}/${weekRange} 生成成功`)
+        console.log(results[results.length - 1])
+      } catch (error) {
+        const msg = `[BatchReport] ❌ 周报 ${version}/${weekRange} 失败: ${(error as Error).message}`
+        results.push(msg)
+        console.error(msg)
+      }
+    }
+
+    return results
   })
 
   ipcMain.handle('get-daily-report-dates', () => {
@@ -805,9 +919,89 @@ ${JSON.stringify(simplifiedContexts)}
 
   createWindow()
 
-  // 应用启动时，若 AI 感知已开启则自动恢复捕获和槽摘要任务
-  const aiSensing = db.getSetting('ai_sensing') === 'true'
+  // ═══ 临时：启动后 15 秒自动触发批量生成历史日报 + 上周周报 ═══
+  setTimeout(async () => {
+    console.log('[BatchReport] 🚀 自动触发批量报告生成...')
+    try {
+      const { generateReport } = await import('./reportGenerator')
+      const versions: Array<'personal' | 'professional'> = ['personal', 'professional']
+
+      const allDates = db.getContextDatesWithData()
+      const today = new Date()
+      const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`
+      const historicalDates = allDates.filter(d => d !== todayStr)
+      console.log(`[BatchReport] 发现 ${historicalDates.length} 个历史日期: ${historicalDates.join(', ')}`)
+
+      // 日报
+      for (const dateStr of historicalDates) {
+        const dayStart = new Date(dateStr + 'T00:00:00')
+        const dayEnd = new Date(dateStr + 'T23:59:59.999')
+        for (const version of versions) {
+          if (db.getScheduledReport('daily', version, dateStr)) {
+            console.log(`[BatchReport] 日报 ${version}/${dateStr} 已存在，跳过`)
+            continue
+          }
+          try {
+            console.log(`[BatchReport] 生成日报 ${version}/${dateStr}...`)
+            const report = await generateReport({
+              reportType: 'daily', version,
+              startMs: dayStart.getTime(), endMs: dayEnd.getTime(),
+              userNotes: '', language: 'zh'
+            })
+            db.saveScheduledReport('daily', version, dateStr, report)
+            console.log(`[BatchReport] ✅ 日报 ${version}/${dateStr} 完成`)
+          } catch (error) {
+            console.error(`[BatchReport] ❌ 日报 ${version}/${dateStr} 失败:`, (error as Error).message)
+          }
+        }
+      }
+
+      // 上周周报
+      const lastMonday = new Date(today)
+      const dow = today.getDay()
+      lastMonday.setDate(today.getDate() - (dow === 0 ? 13 : dow + 6))
+      lastMonday.setHours(0, 0, 0, 0)
+      const lastSunday = new Date(lastMonday)
+      lastSunday.setDate(lastMonday.getDate() + 6)
+      lastSunday.setHours(23, 59, 59, 999)
+      const fmtDate = (d: Date): string =>
+        `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+      const weekRange = `${fmtDate(lastMonday)} ~ ${fmtDate(lastSunday)}`
+
+      for (const version of versions) {
+        if (db.getScheduledReport('weekly', version, weekRange)) {
+          console.log(`[BatchReport] 周报 ${version}/${weekRange} 已存在，跳过`)
+          continue
+        }
+        try {
+          console.log(`[BatchReport] 生成周报 ${version}/${weekRange}...`)
+          const report = await generateReport({
+            reportType: 'weekly', version,
+            startMs: lastMonday.getTime(), endMs: lastSunday.getTime(),
+            userNotes: '', language: 'zh'
+          })
+          db.saveScheduledReport('weekly', version, weekRange, report)
+          console.log(`[BatchReport] ✅ 周报 ${version}/${weekRange} 完成`)
+        } catch (error) {
+          console.error(`[BatchReport] ❌ 周报 ${version}/${weekRange} 失败:`, (error as Error).message)
+        }
+      }
+
+      console.log('[BatchReport] 🎉 批量报告生成全部完成！')
+    } catch (error) {
+      console.error('[BatchReport] 批量生成失败:', (error as Error).message)
+    }
+  }, 15000)
+  // ═══ 临时代码结束 ═══
+
+  // 应用启动时，默认开启 AI 感知（除非用户显式关闭过）
+  const aiSensingSetting = db.getSetting('ai_sensing')
+  const aiSensing = aiSensingSetting !== 'false'
   if (aiSensing) {
+    // 持久化默认开启状态（首次启动时 ai_sensing 为 null，写入 'true'）
+    if (!aiSensingSetting) {
+      db.saveSetting('ai_sensing', 'true')
+    }
     const savedInterval = db.getSetting('capture_interval')
     const intervalMs = savedInterval ? parseInt(savedInterval, 10) * 1000 : 5000
     console.log(`[Main] Auto-starting capture loop: ${intervalMs}ms`)

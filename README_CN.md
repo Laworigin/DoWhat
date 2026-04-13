@@ -4,7 +4,7 @@
 
 **AI 时代的个人职场智能体分身 — 你的工作，从此有了数字化的记忆与大脑**
 
-[English](./README.md) · [提交 Bug](https://github.com/your-repo/issues) · [功能建议](https://github.com/your-repo/issues)
+[English](./README.md) · [提交 Bug](https://github.com/Laworigin/DoWhat/issues) · [功能建议](https://github.com/Laworigin/DoWhat/issues)
 
 ![平台](https://img.shields.io/badge/平台-macOS%20%7C%20Windows%20%7C%20Linux-blue)
 ![Electron](https://img.shields.io/badge/electron-39-47848F?logo=electron)
@@ -104,30 +104,47 @@ DoWhat
 
 ## 🚀 快速开始
 
-### 环境要求
+### 方式一：下载安装包（推荐）
+
+**无需编译，下载即用，开箱即享。**
+
+前往 [**Releases 页面**](https://github.com/Laworigin/DoWhat/releases/latest) 下载适合你平台的安装包：
+
+| 平台 | 下载链接 | 说明 |
+|------|---------|------|
+| **macOS (Apple Silicon)** | [DoWhat-1.0.0.dmg](https://github.com/Laworigin/DoWhat/releases/download/v1.0.0/dowhat-1.0.0.dmg) | 拖入 Applications 即可安装 |
+| **macOS (便携版)** | [DoWhat-1.0.0-arm64-mac.zip](https://github.com/Laworigin/DoWhat/releases/download/v1.0.0/DoWhat-1.0.0-arm64-mac.zip) | 解压直接运行 |
+| **Windows** | 即将推出 | 敬请期待 v1.1.0 |
+| **Linux** | 即将推出 | 敬请期待 v1.1.0 |
+
+> 💡 **macOS 用户提示**：如果遇到"应用已损坏"的提示，请在终端执行 `xattr -cr /Applications/DoWhat.app`。
+
+### 方式二：从源码构建（开发者）
+
+#### 环境要求
 
 - **Node.js** 18+
 - 一个 **OpenAI 兼容的 API Key**（OpenAI、Azure OpenAI 或任意兼容提供商）
 - macOS（推荐）、Windows 或 Linux
 
-### 安装
+#### 安装
 
 ```bash
 # 克隆仓库
-git clone https://github.com/your-repo/dowhat.git
-cd dowhat
+git clone https://github.com/Laworigin/DoWhat.git
+cd DoWhat
 
 # 安装依赖
 npm install
 ```
 
-### 开发模式
+#### 开发模式
 
 ```bash
 npm run dev
 ```
 
-### 构建
+#### 构建
 
 ```bash
 # macOS

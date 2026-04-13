@@ -5,6 +5,37 @@
 
 ---
 
+## 2026-04-13: 周报洞察报告取数范围错误，总结的是上周而非本周
+
+- **问题**：「本周复盘」的 Agent 智能洞察报告内容总结的是上周的工作，而非当前这周的。用户在周一查看时，报告内容全是上周的活动
+- **根因**：缺约束 — `generateAndCacheInsight` 函数中周报的时间范围计算使用 `now - 7 * oneDay`（过去7天），而非从本周一 00:00:00 开始。同时月报也用 `now - 30 * oneDay` 而非本月1号。另外 `get-stats-insight` handler 的缓存读取没有时效性校验，缓存 key 只是 `'week'`，跨周后仍返回旧缓存
+- **修复**：
+  1. `capturer.ts` 的 `generateAndCacheInsight`：周报改为从本周一 00:00 开始，月报改为从本月1号 00:00 开始，与前端 `StatsView.tsx` 的时间范围计算保持一致
+  2. `index.ts` 的 `get-stats-insight` handler：增加缓存时效性校验 `cached.updated_at >= start`，确保缓存属于当前周期
+- **系统改进**：
+  1. 前后端涉及同一时间范围的计算逻辑必须保持一致，建议提取为共享工具函数
+  2. 缓存系统必须有时效性校验机制，不能仅靠 key 匹配就返回缓存
+  3. "过去N天"和"本周/本月"是两种完全不同的语义，选择时必须明确业务需求
+- **状态**：✅ 已修复，已纳入反馈回路
+
+---
+
+## 2026-04-13: 在 JSX 中插入条件渲染时 div 闭合层级错乱导致编译失败
+
+- **问题**：在 StatsView.tsx 中为 `activeCycle` 新增 `'history'` 分支时，用 `{condition ? <A/> : (<>...原有内容...</>)}` 包裹原有内容，但原有内容末尾的 `</div></div>` 是关闭外层容器的，被错误地包进了 Fragment 内部，导致 JSX 闭合层级错乱，babel 编译报错 `Expected corresponding closing tag for <>`
+- **根因**：缺验证 — 修改完代码后没有在开发模式下验证就宣称任务完成，违反了"约束一：改了代码必须验证"。同时对 JSX 嵌套层级的理解不够精确，反复打补丁式修复失败 4 次
+- **修复**：
+  1. 用 `grep` 精确统计 Fragment 内部的 div 打开/关闭数量，确认 Fragment 内部的 div 是自闭合的
+  2. 将 `</div></div>` 移到条件渲染 `)}` 之后，确保外层容器的闭合在条件渲染外面
+  3. 将 `ReportExportModal` 用 `{activeCycle !== 'history' && (...)}` 包裹，避免 history 模式下渲染
+- **系统改进**：
+  1. 在复杂 JSX 中插入条件渲染时，必须先用 grep 或手动计数确认 div 嵌套层级，再动手修改
+  2. 每次代码修改后必须立即运行 `read_lints` 或 `npm run typecheck` 验证，禁止"嘴上完成"
+  3. 同一方案失败 2 次后必须换思路（如从逐行打补丁改为用 grep 精确分析后一次性重写）
+- **状态**：✅ 已修复，已纳入反馈回路
+
+---
+
 ## 2026-04-03: migrateData 缺乏幂等性导致 image_local_path 被反复拼接膨胀到 79657 字符
 
 - **问题**：打包后的应用每次启动都执行 `migrateData`，其中的 `REPLACE(image_local_path, oldPrefix, newPrefix)` SQL 会把已经包含 `userDataPath` 的路径再次替换拼接，导致路径指数级膨胀（从 ~100 字符膨胀到 79657 字符），截图缩略图全部无法加载显示为空白

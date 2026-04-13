@@ -52,6 +52,9 @@ function App(): React.ReactElement {
   useEffect(() => {
     const init = async (): Promise<void> => {
       await checkPermission()
+      // 从后端读取 AI 感知的实际状态（启动时默认开启）
+      const sensingStatus = await window.api.getAiSensingStatus()
+      setIsCapturing(sensingStatus)
     }
     init()
     // 轮询检查权限，方便用户在后台开启后无感恢复

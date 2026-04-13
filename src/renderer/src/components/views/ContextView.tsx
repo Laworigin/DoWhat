@@ -943,73 +943,92 @@ function ContextGroupCard({ group, isExpanded, onToggle }: ContextGroupCardProps
   )
 }
 
-// 简单的 Timeline 组件
-const Timeline: React.FC<{ contexts: ContextItem[] }> = ({ contexts }) => {
-  if (contexts.length === 0) return null
+// 每日工作总结面板（替代原 ACTIVITY TIMELINE）
+const DailyWorkSummaryPanel: React.FC<{ currentDate: Date }> = ({ currentDate }) => {
+  const [summaryText, setSummaryText] = useState<string>('')
+  const [updatedAt, setUpdatedAt] = useState<number>(0)
+  const [isLoading, setIsLoading] = useState(true)
+  const [isExpanded, setIsExpanded] = useState(false)
 
-  // 计算时间范围（从最早到最晚，或者固定 00:00 - 24:00）
-  // 这里我们固定展示当天 08:00 到 24:00 或者是数据覆盖的范围
-  // 为了简单直观，我们把一天分成 1440 分钟，绘制有数据的部分
+  const loadSummary = async (): Promise<void> => {
+    const year = currentDate.getFullYear()
+    const month = String(currentDate.getMonth() + 1).padStart(2, '0')
+    const day = String(currentDate.getDate()).padStart(2, '0')
+    const dateStr = `${year}-${month}-${day}`
 
-  // 简单的可视化：将一天划分为 96 个格子 (每 15 分钟一个)
-  const timeSlots = new Array(96).fill(0).map((_, i) => ({
-    time: i * 15, // minutes from 00:00
-    count: 0,
-    hasProductive: false,
-    hasUnproductive: false
-  }))
-
-  contexts.forEach(ctx => {
-    const date = new Date(ctx.timestamp)
-    const minutes = date.getHours() * 60 + date.getMinutes()
-    const slotIndex = Math.floor(minutes / 15)
-    if (slotIndex >= 0 && slotIndex < 96) {
-      timeSlots[slotIndex].count++
-      // 这里假设 intent_tags 或者其他字段能判断 productive，暂时只用 count
+    const result = await window.api.getDailyWorkSummary(dateStr)
+    if (result) {
+      setSummaryText(result.summary_text)
+      setUpdatedAt(result.updated_at)
+    } else {
+      setSummaryText('')
+      setUpdatedAt(0)
     }
-  })
+    setIsLoading(false)
+  }
 
-  // 找到第一个和最后一个有数据的索引，用于缩放视图（可选），这里先全量展示但高亮有数据区域
+  useEffect(() => {
+    setIsLoading(true)
+    loadSummary()
+    const interval = setInterval(loadSummary, 30000)
+    return () => clearInterval(interval)
+  }, [currentDate])
+
+  const formatUpdateTime = (timestamp: number): string => {
+    if (!timestamp) return ''
+    return new Date(timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+  }
+
+  // 收起时显示的预览文本（取第一行或前 60 个字符）
+  const previewText = summaryText
+    ? summaryText.split('\n').find(line => line.trim().length > 0)?.slice(0, 60) || ''
+    : ''
 
   return (
-    <div className="w-full bg-white/5 rounded-xl border border-white/5 p-4 mb-8">
-      <div className="flex items-center justify-between mb-3">
-        <span className="text-[10px] font-black text-gray-500 uppercase tracking-widest">
-          ACTIVITY TIMELINE (24H)
-        </span>
-        <div className="flex gap-3">
-           <div className="flex items-center gap-1.5">
-              <div className="w-2 h-2 rounded-full bg-orange-500/50"></div>
-              <span className="text-[9px] text-gray-500 font-bold">Active</span>
-           </div>
+    <div className="w-full bg-white/5 rounded-xl border border-white/5 mb-8 overflow-hidden">
+      <button
+        onClick={() => setIsExpanded(prev => !prev)}
+        className="w-full flex items-center justify-between p-4 hover:bg-white/[0.03] transition-colors cursor-pointer"
+      >
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] font-black text-gray-500 uppercase tracking-widest">
+            今日工作总结
+          </span>
+          {!isExpanded && !isLoading && summaryText && (
+            <span className="text-[10px] text-gray-600 truncate max-w-[300px]">
+              — {previewText}…
+            </span>
+          )}
         </div>
-      </div>
+        <div className="flex items-center gap-2">
+          {updatedAt > 0 && (
+            <span className="text-[9px] text-gray-600">
+              更新于 {formatUpdateTime(updatedAt)}
+            </span>
+          )}
+          {isExpanded ? (
+            <ChevronUp className="w-3.5 h-3.5 text-gray-500" />
+          ) : (
+            <ChevronDown className="w-3.5 h-3.5 text-gray-500" />
+          )}
+        </div>
+      </button>
 
-      <div className="relative h-8 flex items-end gap-[1px]">
-        {timeSlots.map((slot, i) => {
-          const height = Math.min(100, slot.count * 20) // Max height cap
-          const isActive = slot.count > 0
-
-          return (
-            <div
-              key={i}
-              className={`flex-1 rounded-t-sm transition-all duration-300 ${isActive ? 'bg-orange-500' : 'bg-white/10'}`}
-              style={{
-                height: isActive ? `${Math.max(20, height)}%` : '4px',
-                opacity: isActive ? 0.8 : 0.1
-              }}
-              title={`${Math.floor(slot.time / 60).toString().padStart(2, '0')}:${(slot.time % 60).toString().padStart(2, '0')} - ${slot.count} snapshots`}
-            ></div>
-          )
-        })}
-      </div>
-      <div className="flex justify-between mt-2 text-[9px] text-gray-600 font-mono">
-        <span>00:00</span>
-        <span>06:00</span>
-        <span>12:00</span>
-        <span>18:00</span>
-        <span>23:59</span>
-      </div>
+      {isExpanded && (
+        <div className="px-4 pb-4">
+          {isLoading ? (
+            <div className="text-[11px] text-gray-600 animate-pulse">加载中...</div>
+          ) : summaryText ? (
+            <div className="text-[11px] text-gray-400 leading-relaxed whitespace-pre-wrap">
+              {summaryText}
+            </div>
+          ) : (
+            <div className="text-[11px] text-gray-600 italic">
+              暂无工作总结，AI 将在收集到足够的行为数据后自动生成
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
@@ -1449,8 +1468,8 @@ export const ContextView: React.FC = () => {
               )}
             </div>
 
-            {/* Timeline */}
-            <Timeline contexts={contexts} />
+            {/* 每日工作总结 */}
+            <DailyWorkSummaryPanel currentDate={currentDate} />
           </div>
 
           {/* Context Grid - Grouped by Consecutive Tasks */}

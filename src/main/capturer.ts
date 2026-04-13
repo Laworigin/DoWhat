@@ -5,8 +5,9 @@ import sharp from 'sharp'
 import OpenAI from 'openai'
 import * as db from './database'
 import { runStorageMaintenance } from './maintenance'
-import { TASK_DISCOVERY_PROMPT, TASK_COMPLETION_PROMPT, TASK_PRIORITY_PROMPT, TASK_CLASSIFICATION_PROMPT } from './prompts/pipeline_optimization'
+import { TASK_DISCOVERY_PROMPT, TASK_COMPLETION_PROMPT, TASK_PRIORITY_PROMPT, TASK_CLASSIFICATION_PROMPT, TASK_CONSOLIDATION_PROMPT, DAILY_WORK_SUMMARY_PROMPT } from './prompts/pipeline_optimization'
 import { REPORT_PERSONAL_GENERATE_PROMPT } from './prompts/report_personal'
+import { generateReport } from './reportGenerator'
 
 /**
  * 从本地文件加载提示词
@@ -1094,7 +1095,84 @@ export function startSlotSummaryLoop(): void {
   runSlotSummaryTick().catch((err) => console.error('[SlotSummary] 初始归纳失败:', err))
   slotSummaryInterval = setInterval(() => {
     runSlotSummaryTick().catch((err) => console.error('[SlotSummary] 定时归纳失败:', err))
+    // 每次 slot 归纳后也刷新每日工作总结
+    generateDailyWorkSummary().catch((err) => console.error('[DailyWorkSummary] 生成失败:', err))
   }, SLOT_REFRESH_INTERVAL_MS)
+
+  // 启动时也立即生成一次每日工作总结
+  generateDailyWorkSummary().catch((err) => console.error('[DailyWorkSummary] 初始生成失败:', err))
+}
+
+/**
+ * 生成每日工作总结：基于 slot_summaries 和 backlog 任务状态，
+ * 用 AI 生成一段自然语言的工作日志，存入 daily_work_summary 表。
+ */
+async function generateDailyWorkSummary(): Promise<void> {
+  const apiKey = db.getSetting('api_key')
+  const endpoint = db.getSetting('endpoint')
+  const modelName = db.getSetting('model_name') || 'qwen-turbo'
+
+  if (!apiKey || !endpoint) {
+    console.log('[DailyWorkSummary] API 未配置，跳过')
+    return
+  }
+
+  const today = new Date().toISOString().split('T')[0]
+
+  // 收集今天的 slot 总结
+  const slotSummaries = db.getSlotSummariesForDate(today)
+  if (slotSummaries.length === 0) {
+    console.log('[DailyWorkSummary] 今日无 slot 数据，跳过')
+    return
+  }
+
+  // 解析 slot 总结为可读文本
+  const slotTexts = slotSummaries
+    .sort((a, b) => a.slot_start_ms - b.slot_start_ms)
+    .map(slot => {
+      const time = new Date(slot.slot_start_ms).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+      try {
+        const parsed = JSON.parse(slot.summary)
+        return `[${time}] ${parsed.title}：${parsed.description || ''}`
+      } catch {
+        return `[${time}] ${slot.summary}`
+      }
+    })
+    .join('\n')
+
+  // 收集今天的任务状态
+  const allBacklog = db.getBacklog() as { id: string; title: string; completed: number; task_date: string; is_hidden: number }[]
+  const todayTasks = allBacklog.filter(item => item.task_date === today && !item.is_hidden)
+  const completedTasks = todayTasks.filter(item => item.completed).map(item => item.title)
+  const pendingTasks = todayTasks.filter(item => !item.completed).map(item => item.title)
+
+  try {
+    const openai = new OpenAI({ apiKey, baseURL: endpoint.trim().replace(/\/+$/, '') })
+
+    const response = await openai.chat.completions.create({
+      model: modelName,
+      messages: [
+        { role: 'system', content: DAILY_WORK_SUMMARY_PROMPT },
+        {
+          role: 'user',
+          content: `### slot_summaries:\n${slotTexts}\n\n### completed_tasks:\n${completedTasks.length > 0 ? completedTasks.map(t => `- ${t}`).join('\n') : '（暂无）'}\n\n### pending_tasks:\n${pendingTasks.length > 0 ? pendingTasks.map(t => `- ${t}`).join('\n') : '（暂无）'}`
+        }
+      ],
+      max_tokens: 600,
+      temperature: 0.4
+    })
+
+    const summaryText = response.choices[0].message.content?.trim() || ''
+    if (summaryText) {
+      db.upsertDailyWorkSummary(today, summaryText)
+      console.log(`[DailyWorkSummary] 今日工作总结已更新 (${summaryText.length} 字)`)
+    }
+
+    const tokens = response.usage?.total_tokens || 0
+    db.saveTokenUsage(tokens, modelName, 'daily_work_summary')
+  } catch (error) {
+    console.error('[DailyWorkSummary] AI 生成失败:', error)
+  }
 }
 
 /**
@@ -1357,14 +1435,20 @@ async function optimizeBacklogState(newActivity?: string): Promise<void> {
     let hasChanges = false
 
     // ─── Step 1: 新任务识别（独立 AI 调用）───────────────────────────────
-    console.log(`[Capturer] Step1: 识别新任务... (现有任务: ${todayItems.length})`)
+    const todayTaskCount = db.getTodayTaskCount()
+    const maxDailyTasks = 15
+
+    if (todayTaskCount >= maxDailyTasks) {
+      console.log(`[Capturer] Step1: 跳过新任务识别，今日任务已达上限 (${todayTaskCount}/${maxDailyTasks})`)
+    } else {
+    console.log(`[Capturer] Step1: 识别新任务... (现有任务: ${todayItems.length}, 今日总量: ${todayTaskCount}/${maxDailyTasks})`)
     try {
       const existingTitles = todayItems.map(item => item.title)
       const discoveryResponse = await openai.chat.completions.create({
         model: modelName || 'gpt-4o',
         messages: [
           { role: 'system', content: TASK_DISCOVERY_PROMPT },
-          { role: 'user', content: `### existing_titles:\n${JSON.stringify(existingTitles)}\n\n### recent_activity:\n${newActivity}` }
+          { role: 'user', content: `### existing_titles:\n${JSON.stringify(existingTitles)}\n\n### today_task_count: ${todayTaskCount}\n\n### recent_activity:\n${newActivity}` }
         ],
         response_format: { type: 'json_object' }
       })
@@ -1415,6 +1499,7 @@ async function optimizeBacklogState(newActivity?: string): Promise<void> {
     } catch (error) {
       console.error('[Capturer] Step1 新任务识别失败:', error)
     }
+    } // end of daily task limit else block
 
     // ─── Step 2: 完成状态判断（独立 AI 调用）───────────────────────────────
     const uncompletedTasks = todayItems.filter(item => !item.completed)
@@ -1497,7 +1582,103 @@ async function optimizeBacklogState(newActivity?: string): Promise<void> {
       }
     }
 
-    // OKR 主动扫描已移除：改为用户手动录入文字后 AI 解析
+    // ─── Step 3.5: 任务合并归类（超限时由 AI 合并相似任务）──────────────────────
+    // 各分区数量上限
+    const ZONE_LIMITS = { high_priority: 5, daily: 5, backlog: 10 }
+
+    // 重新获取最新任务列表（Step 2/3 可能已修改了状态）
+    const latestBacklog = db.getBacklog() as { id: string; title: string; description?: string; category: string; priority: number; completed: number; task_date: string; is_hidden: number }[]
+    const latestTodayActive = latestBacklog.filter(item => item.task_date === today && !item.is_hidden && !item.completed)
+
+    const zoneHighPriority = latestTodayActive.filter(item => item.priority === 1)
+    const zoneDaily = latestTodayActive.filter(item => item.category === 'day' && item.priority !== 1)
+    const backlogCats = new Set(['backlog', 'week', 'month'])
+    const zoneBacklog = latestTodayActive.filter(item => backlogCats.has(item.category?.toLowerCase() ?? '') && item.priority !== 1)
+
+    const overflowZones: { zone: string; tasks: typeof latestTodayActive; limit: number }[] = []
+    if (zoneHighPriority.length > ZONE_LIMITS.high_priority) {
+      overflowZones.push({ zone: 'high_priority', tasks: zoneHighPriority, limit: ZONE_LIMITS.high_priority })
+    }
+    if (zoneDaily.length > ZONE_LIMITS.daily) {
+      overflowZones.push({ zone: 'daily', tasks: zoneDaily, limit: ZONE_LIMITS.daily })
+    }
+    if (zoneBacklog.length > ZONE_LIMITS.backlog) {
+      overflowZones.push({ zone: 'backlog', tasks: zoneBacklog, limit: ZONE_LIMITS.backlog })
+    }
+
+    for (const { zone, tasks: zoneTasks, limit } of overflowZones) {
+      console.log(`[Capturer] Step3.5: ${zone} 分区超限 (${zoneTasks.length}/${limit})，触发 AI 合并归类...`)
+      try {
+        const tasksForConsolidation = zoneTasks.map(item => ({
+          id: item.id,
+          title: item.title,
+          description: item.description || ''
+        }))
+
+        const consolidationResponse = await openai.chat.completions.create({
+          model: modelName || 'gpt-4o',
+          messages: [
+            { role: 'system', content: TASK_CONSOLIDATION_PROMPT },
+            { role: 'user', content: `### overflow_zone: ${zone}\n### max_count: ${limit}\n### tasks:\n${JSON.stringify(tasksForConsolidation, null, 2)}` }
+          ],
+          response_format: { type: 'json_object' }
+        })
+
+        const consolidationContent = consolidationResponse.choices[0].message.content
+        if (consolidationContent) {
+          const consolidationResult = JSON.parse(consolidationContent) as {
+            merges?: { merged_title: string; merged_description: string; source_task_ids: string[]; keep_category: string; keep_priority: number }[]
+            hide_task_ids?: string[]
+          }
+
+          // 执行合并：隐藏旧任务，创建合并后的新任务
+          if (consolidationResult.merges && Array.isArray(consolidationResult.merges)) {
+            for (const merge of consolidationResult.merges) {
+              if (!merge.source_task_ids || merge.source_task_ids.length < 2) continue
+
+              // 隐藏被合并的旧任务
+              for (const sourceId of merge.source_task_ids) {
+                db.hideBacklogItem(sourceId, true)
+                console.log(`[Capturer] 合并隐藏: "${zoneTasks.find(t => t.id === sourceId)?.title || sourceId}"`)
+              }
+
+              // 创建合并后的新任务
+              const mergedTaskId = `merged_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+              const mergedCategory = merge.keep_category || (zone === 'daily' ? 'day' : 'backlog')
+              const mergedPriority = zone === 'high_priority' ? 1 : (merge.keep_priority || 3)
+              db.addBacklogItem({
+                id: mergedTaskId,
+                title: merge.merged_title.trim(),
+                description: merge.merged_description?.trim() || '',
+                progress: 0,
+                subtasks: '',
+                color: 'bg-indigo-500',
+                category: mergedCategory,
+                project_id: null,
+                created_at: Date.now(),
+                priority: mergedPriority
+              })
+              console.log(`[Capturer] 合并创建: "${merge.merged_title}" (来源: ${merge.source_task_ids.length} 个任务)`)
+              hasChanges = true
+            }
+          }
+
+          // 隐藏低价值任务（合并后仍超限时使用）
+          if (consolidationResult.hide_task_ids && Array.isArray(consolidationResult.hide_task_ids)) {
+            for (const hideId of consolidationResult.hide_task_ids) {
+              db.hideBacklogItem(hideId, true)
+              console.log(`[Capturer] 超限隐藏: "${zoneTasks.find(t => t.id === hideId)?.title || hideId}"`)
+              hasChanges = true
+            }
+          }
+        }
+
+        const consolidationTokens = consolidationResponse.usage?.total_tokens || 0
+        db.saveTokenUsage(consolidationTokens, modelName || 'gpt-4o', 'task_consolidation')
+      } catch (error) {
+        console.error(`[Capturer] Step3.5 ${zone} 合并归类失败:`, error)
+      }
+    }
 
     // ─── Step 4: OKR 驱动的长线任务分类（将 backlog 任务提升为 week/month）──────────
     const classifiableBacklog = db.getBacklog() as { id: string; title: string; description?: string; category: string; priority?: number; completed: number; task_date: string; is_hidden: number }[]
@@ -1773,7 +1954,6 @@ let lastMonthlyInsightDate = ''
  */
 async function generateAndCacheInsight(cycle: 'day' | 'week' | 'month'): Promise<void> {
   const now = Date.now()
-  const oneDay = 24 * 60 * 60 * 1000
 
   let startMs: number
   if (cycle === 'day') {
@@ -1781,9 +1961,19 @@ async function generateAndCacheInsight(cycle: 'day' | 'week' | 'month'): Promise
     today.setHours(0, 0, 0, 0)
     startMs = today.getTime()
   } else if (cycle === 'week') {
-    startMs = now - 7 * oneDay
+    // 本周复盘：从本周一 00:00:00 开始（与前端 StatsView 保持一致）
+    const monday = new Date()
+    const dayOfWeek = monday.getDay()
+    const diffToMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1
+    monday.setDate(monday.getDate() - diffToMonday)
+    monday.setHours(0, 0, 0, 0)
+    startMs = monday.getTime()
   } else {
-    startMs = now - 30 * oneDay
+    // 月度度量：从本月1号 00:00:00 开始（与前端 StatsView 保持一致）
+    const firstDay = new Date()
+    firstDay.setDate(1)
+    firstDay.setHours(0, 0, 0, 0)
+    startMs = firstDay.getTime()
   }
 
   // 从 slot_summaries 获取该周期内的所有 15 分钟槽归纳
@@ -1949,7 +2139,10 @@ function getYesterdayDateString(): string {
 }
 
 /**
- * 定时检查：如果当前时间是 10:30 且昨天的日报尚未生成，则自动生成
+ * 定时检查：如果当前时间是 10:30，自动生成定时报告
+ * - 每天：生成昨天的日报（个人版 + 专业版）
+ * - 每周一：生成上周的周报（个人版 + 专业版）
+ * - 每月1号：生成上月的月报（个人版 + 专业版）
  */
 async function runDailyReportTick(): Promise<void> {
   const now = new Date()
@@ -1959,20 +2152,112 @@ async function runDailyReportTick(): Promise<void> {
   // 只在 10:30 这一分钟内触发（每分钟检查一次，所以只会命中一次）
   if (hour !== 10 || minute !== 30) return
 
+  // 1. 生成昨天的日报（保留原有逻辑）
   const yesterday = getYesterdayDateString()
   const existing = db.getDailyReport(yesterday)
   if (existing) {
     console.log(`[DailyReport] ${yesterday} 日报已存在，跳过定时生成`)
-    return
+  } else {
+    console.log(`[DailyReport] 定时任务触发：开始生成 ${yesterday} 的日报...`)
+    try {
+      await generateDailyReport(yesterday)
+      console.log(`[DailyReport] 定时任务完成：${yesterday} 日报已生成并持久化`)
+    } catch (error) {
+      console.error(`[DailyReport] 定时任务失败：${yesterday}`, (error as Error).message)
+    }
   }
 
-  console.log(`[DailyReport] 定时任务触发：开始生成 ${yesterday} 的日报...`)
-  try {
-    await generateDailyReport(yesterday)
-    console.log(`[DailyReport] 定时任务完成：${yesterday} 日报已生成并持久化`)
-  } catch (error) {
-    console.error(`[DailyReport] 定时任务失败：${yesterday}`, (error as Error).message)
+  // 2. 生成定时报告（日/周/月 × 个人/专业）
+  await generateScheduledReports(now)
+}
+
+/**
+ * 生成定时报告：日报（每天）、周报（每周一）、月报（每月1号）
+ * 每种报告同时生成个人版和专业版
+ */
+async function generateScheduledReports(now: Date): Promise<void> {
+  const versions: Array<'personal' | 'professional'> = ['personal', 'professional']
+
+  // ── 日报：每天生成昨天的 ──
+  const yesterdayDate = new Date(now)
+  yesterdayDate.setDate(yesterdayDate.getDate() - 1)
+  const yesterdayStr = formatDateString(yesterdayDate)
+  const yesterdayStart = new Date(yesterdayDate)
+  yesterdayStart.setHours(0, 0, 0, 0)
+  const yesterdayEnd = new Date(yesterdayDate)
+  yesterdayEnd.setHours(23, 59, 59, 999)
+
+  for (const version of versions) {
+    const existingDaily = db.getScheduledReport('daily', version, yesterdayStr)
+    if (existingDaily) continue
+    try {
+      console.log(`[ScheduledReport] 生成日报 ${version}/${yesterdayStr}...`)
+      const report = await generateReport({
+        reportType: 'daily', version, startMs: yesterdayStart.getTime(), endMs: yesterdayEnd.getTime(),
+        userNotes: '', language: 'zh'
+      })
+      db.saveScheduledReport('daily', version, yesterdayStr, report)
+    } catch (error) {
+      console.error(`[ScheduledReport] 日报 ${version}/${yesterdayStr} 生成失败:`, (error as Error).message)
+    }
   }
+
+  // ── 周报：每周一生成上周的 ──
+  if (now.getDay() === 1) {
+    const lastMonday = new Date(now)
+    lastMonday.setDate(lastMonday.getDate() - 7)
+    lastMonday.setHours(0, 0, 0, 0)
+    const lastSunday = new Date(now)
+    lastSunday.setDate(lastSunday.getDate() - 1)
+    lastSunday.setHours(23, 59, 59, 999)
+    const weekRange = `${formatDateString(lastMonday)} ~ ${formatDateString(lastSunday)}`
+
+    for (const version of versions) {
+      const existingWeekly = db.getScheduledReport('weekly', version, weekRange)
+      if (existingWeekly) continue
+      try {
+        console.log(`[ScheduledReport] 生成周报 ${version}/${weekRange}...`)
+        const report = await generateReport({
+          reportType: 'weekly', version, startMs: lastMonday.getTime(), endMs: lastSunday.getTime(),
+          userNotes: '', language: 'zh'
+        })
+        db.saveScheduledReport('weekly', version, weekRange, report)
+      } catch (error) {
+        console.error(`[ScheduledReport] 周报 ${version}/${weekRange} 生成失败:`, (error as Error).message)
+      }
+    }
+  }
+
+  // ── 月报：每月1号生成上月的 ──
+  if (now.getDate() === 1) {
+    const lastMonthEnd = new Date(now)
+    lastMonthEnd.setDate(0) // 上月最后一天
+    lastMonthEnd.setHours(23, 59, 59, 999)
+    const lastMonthStart = new Date(lastMonthEnd.getFullYear(), lastMonthEnd.getMonth(), 1, 0, 0, 0, 0)
+    const monthRange = `${formatDateString(lastMonthStart)} ~ ${formatDateString(lastMonthEnd)}`
+
+    for (const version of versions) {
+      const existingMonthly = db.getScheduledReport('monthly', version, monthRange)
+      if (existingMonthly) continue
+      try {
+        console.log(`[ScheduledReport] 生成月报 ${version}/${monthRange}...`)
+        const report = await generateReport({
+          reportType: 'monthly', version, startMs: lastMonthStart.getTime(), endMs: lastMonthEnd.getTime(),
+          userNotes: '', language: 'zh'
+        })
+        db.saveScheduledReport('monthly', version, monthRange, report)
+      } catch (error) {
+        console.error(`[ScheduledReport] 月报 ${version}/${monthRange} 生成失败:`, (error as Error).message)
+      }
+    }
+  }
+}
+
+/**
+ * 格式化日期为 YYYY-MM-DD
+ */
+function formatDateString(date: Date): string {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
 }
 
 export function startDailyReportLoop(): void {

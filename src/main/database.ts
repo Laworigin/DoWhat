@@ -77,6 +77,12 @@ export function initDatabase(appDataPath?: string): void {
         updated_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS daily_work_summary (
+        date TEXT PRIMARY KEY,
+        summary_text TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS model_pricing (
         model_name TEXT PRIMARY KEY,
         input_price_per_1m REAL NOT NULL,  -- 每百万 input token 的美元价格
@@ -96,6 +102,15 @@ export function initDatabase(appDataPath?: string): void {
         insight_text TEXT NOT NULL,
         warning_text TEXT,
         generated_at INTEGER NOT NULL   -- 生成时间戳（毫秒）
+      );
+
+      CREATE TABLE IF NOT EXISTS scheduled_reports (
+        report_type TEXT NOT NULL,      -- 'daily' | 'weekly' | 'monthly'
+        version TEXT NOT NULL,          -- 'personal' | 'professional'
+        date_range TEXT NOT NULL,       -- 'YYYY-MM-DD' 或 'YYYY-MM-DD ~ YYYY-MM-DD'
+        report_text TEXT NOT NULL,
+        generated_at INTEGER NOT NULL,
+        PRIMARY KEY (report_type, version, date_range)
       );
     `)
 
@@ -410,6 +425,50 @@ export function getVisibleBacklog(): any[] {
 }
 
 /**
+ * 清理超出上限的低优先级待处理任务
+ * 保留 priority 最高的 maxVisible 个未完成任务，其余标记为 is_hidden=1
+ * 在应用启动时调用，确保每日任务列表简洁聚焦
+ */
+export function cleanupExcessTasks(maxVisible: number = 10): number {
+  if (!db) return 0
+
+  const today = new Date().toISOString().split('T')[0]
+
+  // 获取今日所有未完成、未隐藏的任务，按优先级排序
+  const pendingTasks = db.prepare(`
+    SELECT id FROM backlog
+    WHERE completed = 0 AND is_hidden = 0 AND task_date = ?
+    ORDER BY priority ASC, created_at DESC
+  `).all(today) as { id: string }[]
+
+  if (pendingTasks.length <= maxVisible) return 0
+
+  // 超出上限的任务 ID
+  const tasksToHide = pendingTasks.slice(maxVisible)
+  const hideStmt = db.prepare('UPDATE backlog SET is_hidden = 1 WHERE id = ?')
+
+  for (const task of tasksToHide) {
+    hideStmt.run(task.id)
+  }
+
+  console.log(`[DB] cleanupExcessTasks: hidden ${tasksToHide.length} low-priority tasks (kept top ${maxVisible})`)
+  return tasksToHide.length
+}
+
+/**
+ * 获取今日任务总数（包括已完成和未完成，不含隐藏）
+ * 用于每日日程总量上限控制
+ */
+export function getTodayTaskCount(): number {
+  if (!db) return 0
+  const today = new Date().toISOString().split('T')[0]
+  const result = db.prepare(
+    'SELECT COUNT(*) as count FROM backlog WHERE is_hidden = 0 AND task_date = ?'
+  ).get(today) as { count: number }
+  return result.count
+}
+
+/**
  * 获取今日待处理的任务（未完成、未隐藏、task_date = 今天）
  * 用于定时扫描和 AI 去重判断
  * 只扫描今日任务，避免处理大量历史任务导致去重效果差
@@ -433,12 +492,16 @@ export function inheritUnfinishedTasks(): number {
 
   const today = new Date().toISOString().split('T')[0]
 
-  // 查询所有历史未完成任务（不属于今天的）
+  // 每日继承上限：只继承优先级最高的 N 个任务，避免任务列表无限膨胀
+  const maxInheritCount = 5
+
+  // 查询所有历史未完成任务（不属于今天的），按优先级排序（1=最高）
   const unfinishedHistoryTasks = db.prepare(`
     SELECT * FROM backlog
     WHERE completed = 0
       AND is_hidden = 0
       AND (task_date IS NULL OR task_date != ?)
+    ORDER BY priority ASC, created_at DESC
   `).all(today) as any[]
 
   if (unfinishedHistoryTasks.length === 0) return 0
@@ -467,6 +530,9 @@ export function inheritUnfinishedTasks(): number {
   `)
 
   for (const task of unfinishedHistoryTasks) {
+    // 达到继承上限后停止，保持每日任务聚焦
+    if (inheritedCount >= maxInheritCount) break
+
     // origin_id 始终指向最原始的任务 ID
     const trueOriginId: string = task.origin_id ?? task.id
 
@@ -499,7 +565,8 @@ export function inheritUnfinishedTasks(): number {
     inheritedCount++
   }
 
-  console.log(`[DB] inheritUnfinishedTasks: inherited ${inheritedCount} tasks to ${today}`)
+  const skippedCount = unfinishedHistoryTasks.length - inheritedCount
+  console.log(`[DB] inheritUnfinishedTasks: inherited ${inheritedCount} tasks to ${today} (skipped ${skippedCount} lower-priority tasks, max=${maxInheritCount})`)
   return inheritedCount
 }
 
@@ -804,6 +871,32 @@ export function getContextsInRangeByKeywords(startMs: number, endMs: number, key
     .all(startMs, endMs, ...params, limit) as { id: number; timestamp: number; ai_summary: string; image_local_path: string }[]
 }
 
+// 每日工作总结相关
+
+/**
+ * 获取指定日期的每日工作总结
+ */
+export function getDailyWorkSummary(date: string): { summary_text: string; updated_at: number } | undefined {
+  if (!db) return undefined
+  return db
+    .prepare('SELECT summary_text, updated_at FROM daily_work_summary WHERE date = ?')
+    .get(date) as { summary_text: string; updated_at: number } | undefined
+}
+
+/**
+ * 插入或更新每日工作总结
+ */
+export function upsertDailyWorkSummary(date: string, summaryText: string): void {
+  if (!db) return
+  db.prepare(`
+    INSERT INTO daily_work_summary (date, summary_text, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(date) DO UPDATE SET
+      summary_text = excluded.summary_text,
+      updated_at = excluded.updated_at
+  `).run(date, summaryText, Date.now())
+}
+
 // Token 相关
 export function saveTokenUsage(tokens: number, model: string, type: string): void {
   if (!db) return
@@ -1045,4 +1138,68 @@ export function getDailyReportDates(): string[] {
     .prepare('SELECT date FROM daily_reports ORDER BY date DESC')
     .all() as { date: string }[]
   return rows.map((row) => row.date)
+}
+
+// Scheduled Reports 相关（定时生成的日/周/月报告）
+
+export interface ScheduledReportRow {
+  report_type: string
+  version: string
+  date_range: string
+  report_text: string
+  generated_at: number
+}
+
+export function saveScheduledReport(
+  reportType: string,
+  version: string,
+  dateRange: string,
+  reportText: string
+): void {
+  if (!db) return
+  db.prepare(`
+    INSERT OR REPLACE INTO scheduled_reports (report_type, version, date_range, report_text, generated_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(reportType, version, dateRange, reportText, Date.now())
+  console.log(`[DB] Scheduled report saved: ${reportType}/${version} for ${dateRange}`)
+}
+
+export function getScheduledReport(
+  reportType: string,
+  version: string,
+  dateRange: string
+): ScheduledReportRow | null {
+  if (!db) return null
+  const row = db
+    .prepare('SELECT * FROM scheduled_reports WHERE report_type = ? AND version = ? AND date_range = ?')
+    .get(reportType, version, dateRange) as ScheduledReportRow | undefined
+  return row ?? null
+}
+
+export function getScheduledReportsByType(reportType: string): ScheduledReportRow[] {
+  if (!db) return []
+  return db
+    .prepare('SELECT * FROM scheduled_reports WHERE report_type = ? ORDER BY date_range DESC')
+    .all(reportType) as ScheduledReportRow[]
+}
+
+export function getAllScheduledReports(): ScheduledReportRow[] {
+  if (!db) return []
+  return db
+    .prepare('SELECT * FROM scheduled_reports ORDER BY generated_at DESC')
+    .all() as ScheduledReportRow[]
+}
+
+/**
+ * 获取所有有 AI 分析数据的历史日期（用于批量回溯生成报告）
+ */
+export function getContextDatesWithData(): string[] {
+  if (!db) return []
+  const rows = db.prepare(`
+    SELECT DISTINCT date(timestamp / 1000, 'unixepoch', 'localtime') as day
+    FROM contexts
+    WHERE ai_summary IS NOT NULL AND ai_summary != ''
+    ORDER BY day DESC
+  `).all() as { day: string }[]
+  return rows.map(r => r.day)
 }

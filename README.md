@@ -4,7 +4,7 @@
 
 **Your AI-native personal work agent — an intelligent digital twin for your professional life**
 
-[中文文档](./README_CN.md) · [Report Bug](https://github.com/your-repo/issues) · [Request Feature](https://github.com/your-repo/issues)
+[中文文档](./README_CN.md) · [Report Bug](https://github.com/Laworigin/DoWhat/issues) · [Request Feature](https://github.com/Laworigin/DoWhat/issues)
 
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-blue)
 ![Electron](https://img.shields.io/badge/electron-39-47848F?logo=electron)
@@ -104,30 +104,47 @@ DoWhat
 
 ## 🚀 Getting Started
 
-### Prerequisites
+### Option 1: Download Pre-built Installer (Recommended)
+
+**No compilation needed — download, install, and start using immediately.**
+
+Go to the [**Releases page**](https://github.com/Laworigin/DoWhat/releases/latest) and download the installer for your platform:
+
+| Platform | Download | Notes |
+|----------|----------|-------|
+| **macOS (Apple Silicon)** | [DoWhat-1.0.0.dmg](https://github.com/Laworigin/DoWhat/releases/download/v1.0.0/dowhat-1.0.0.dmg) | Drag to Applications to install |
+| **macOS (Portable)** | [DoWhat-1.0.0-arm64-mac.zip](https://github.com/Laworigin/DoWhat/releases/download/v1.0.0/DoWhat-1.0.0-arm64-mac.zip) | Unzip and run directly |
+| **Windows** | Coming soon | Stay tuned for v1.1.0 |
+| **Linux** | Coming soon | Stay tuned for v1.1.0 |
+
+> 💡 **macOS users**: If you see "app is damaged" warning, run `xattr -cr /Applications/DoWhat.app` in Terminal.
+
+### Option 2: Build from Source (For Developers)
+
+#### Prerequisites
 
 - **Node.js** 18+
 - An **OpenAI-compatible API key** (OpenAI, Azure OpenAI, or any compatible provider)
 - macOS (recommended), Windows, or Linux
 
-### Installation
+#### Installation
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-repo/dowhat.git
-cd dowhat
+git clone https://github.com/Laworigin/DoWhat.git
+cd DoWhat
 
 # Install dependencies
 npm install
 ```
 
-### Development
+#### Development
 
 ```bash
 npm run dev
 ```
 
-### Build
+#### Build
 
 ```bash
 # macOS
