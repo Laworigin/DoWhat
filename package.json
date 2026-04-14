@@ -1,6 +1,6 @@
 {
   "name": "dowhat",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "DoWhat (做啥) — AI-powered personal work journal for professionals",
   "main": "./out/main/index.js",
   "author": "",
