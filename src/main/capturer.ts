@@ -2280,16 +2280,13 @@ export function stopDailyReportLoop(): void {
 }
 
 /**
- * 启动时兜底检查：如果当前时间在 0:00-10:30 之间，且昨天的日报尚未生成，则立即生成。
- * 用于覆盖"用户在 10:30 之前打开应用"的场景。
+ * 启动时兜底检查：无论何时启动，只要昨天的日报尚未生成，就立即生成。
+ * 之前限制在 0:00-10:30 之间才触发，导致用户在 10:30 之后启动应用时昨天的日报永远不会被生成。
  */
 export async function ensureYesterdayReportOnStartup(): Promise<void> {
   const now = new Date()
   const hour = now.getHours()
   const minute = now.getMinutes()
-  const isBeforeScheduledTime = hour < 10 || (hour === 10 && minute < 30)
-
-  if (!isBeforeScheduledTime) return
 
   const yesterday = getYesterdayDateString()
   const existing = db.getDailyReport(yesterday)
